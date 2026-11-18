@@ -12,6 +12,9 @@
   list      列出备份。
   status    对比上次 scan，列出变过但没有备份覆盖的文件。
   selftest  在系统临时目录里造假 HOME，自检 backup → set → seal → rollback。Windows 上 backup 前会自动跑。
+  skills    一次改很多个 skill 的状态（整组或点名），只写 skillOverrides，skill 文件不动。
+  show      从 scan 的 json 里取一组 skill 的完整名单，不用重扫。
+  compare   改之前、改之后各一份 scan 的 json，对比新开会话第一次请求的实测用量。
 
 除 scan 外，写入只发生在 HOME 和 backup 时用 --root 声明的目录里。
 """
@@ -36,7 +39,7 @@ try:
 except ImportError:  # Python < 3.11
     tomllib = None
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 STORE = ".save-my-tokens"
 HERE = os.path.dirname(os.path.abspath(__file__))
 SWITCHES = os.path.join(os.path.dirname(HERE), "references", "switches.json")
@@ -346,6 +349,89 @@ CC_NEEDLES = (b'"Skill"', b'"Agent"', b'"Task"', b'"mcp__')
 
 
 TS_RE = re.compile(rb'"timestamp":\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)')
+USAGE_RE = re.compile(rb'"usage":\s*\{')
+U_IN_RE = re.compile(rb'"input_tokens":\s*(\d+)')
+U_CC_RE = re.compile(rb'"cache_creation_input_tokens":\s*(\d+)')
+U_CR_RE = re.compile(rb'"cache_read_input_tokens":\s*(\d+)')
+MODEL_RE = re.compile(rb'"model":\s*"([^"]+)"')
+MSGID_RE = re.compile(rb'"id":\s*"(msg_[^"]+)"')
+CTX_BIN = 100000          # 请求大小按 10 万 token 一档统计
+BIG_REWRITE = 100000      # 多大的历史没命中缓存算「整段重算」
+
+
+def str_chars(o, depth=0):
+    """一个对象里所有字符串值的总长度（最多往下三层）。用来量日志里各种附带信息的大小。"""
+    if isinstance(o, str):
+        return len(o)
+    if depth >= 3:
+        return 0
+    if isinstance(o, dict):
+        return sum(str_chars(v, depth + 1) for k, v in o.items() if k != "type")
+    if isinstance(o, list):
+        return sum(str_chars(v, depth + 1) for v in o)
+    return 0
+
+
+def note_head(head, line):
+    """新开会话时，Claude Code 会把这次请求带了什么记进日志：规则文件、skill 清单、工具说明……
+    这里只量每一块的字符数，不保留内容。"""
+    if len(line) > 4000000:
+        return
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(rec, dict):
+        return
+    parts = head["parts"]
+    if rec.get("type") == "api-request-shape":
+        shape = rec.get("shape") if isinstance(rec.get("shape"), dict) else {}
+        if head["tools"] is not None:
+            return          # 只看第一份：后面的是会话中途工具变了之后的
+        parts["system"] = str_chars(shape.get("system"))
+        tools = {"builtin": {"n": 0, "chars": 0}, "mcp": {}}
+        for t in shape.get("tools") or []:
+            if not isinstance(t, dict):
+                continue
+            size = len(json.dumps(t, ensure_ascii=False))
+            name = str(t.get("name") or "")
+            if name.startswith("mcp__") and name.count("__") >= 2:
+                srv = tools["mcp"].setdefault(name.split("__", 2)[1], {"n": 0, "chars": 0})
+            else:
+                srv = tools["builtin"]
+            srv["n"] += 1
+            srv["chars"] += size
+        head["tools"] = tools
+        parts["builtin_tools"] = tools["builtin"]["chars"]
+        parts["mcp_tools"] = sum(v["chars"] for v in tools["mcp"].values())
+        return
+    a = rec.get("attachment")
+    if rec.get("type") != "attachment" or not isinstance(a, dict):
+        return
+    kind = a.get("type")
+    if kind == "skill_listing":
+        if a.get("isInitial") and isinstance(a.get("content"), str):
+            head["listing"] = True
+            parts["skills"] = len(a["content"])
+            head["skill_count"] = a.get("skillCount") or len(a.get("names") or [])
+    elif kind == "instructions":
+        for f in a.get("files") or []:
+            if isinstance(f, dict) and isinstance(f.get("content"), str):
+                head["files"].append({"path": str(f.get("path") or ""), "kind": str(f.get("type") or ""),
+                                      "chars": len(f["content"])})
+        parts["rules"] = sum(f["chars"] for f in head["files"])
+    elif kind == "mcp_instructions_delta":
+        parts["mcp_notes"] = parts.get("mcp_notes", 0) + str_chars(a.get("addedBlocks"))
+    elif kind == "deferred_tools_delta":
+        parts["deferred"] = parts.get("deferred", 0) + str_chars(a.get("addedLines"))
+        head["deferred_n"] = head.get("deferred_n", 0) + len(a.get("addedNames") or [])
+    elif kind == "agent_listing_delta":
+        parts["agents"] = parts.get("agents", 0) + str_chars(a.get("addedLines"))
+    elif kind == "hook_success":
+        if a.get("hookEvent") == "SessionStart" and isinstance(a.get("content"), str):
+            parts["hooks"] = parts.get("hooks", 0) + len(a["content"])
+    elif kind != "prompt_snapshot":
+        parts["other"] = parts.get("other", 0) + str_chars(a)
 
 
 def open_log(path):
@@ -397,16 +483,26 @@ def scan_claude_logs(home, cutoff):
     cutoff_iso = iso_utc(cutoff)
     r = {"present": os.path.isdir(root), "files": 0, "bytes": 0, "older_evidence": False, "earliest": "",
          "unreadable": 0, "version": None, "cwds": Counter(), "skill_model": {}, "skill_user": {},
-         "agents": {}, "mcp": {}, "listings": []}
+         "agents": {}, "mcp": {}, "listings": [],
+         # 下面几样都是从日志里的用量数字直接数出来的
+         "starts": [],                                   # 每个新会话的第一次请求
+         "req": {"main": {}, "sub": {}},                 # 请求数和输入 token，按模型
+         "bins": Counter(), "bin_tokens": Counter(),     # 主会话请求按大小分档
+         "peaks": [],                                    # 每个会话文件里最大的一次请求
+         "rewrites": {},                                 # 没命中缓存、整段重算的请求
+         "agent_model": Counter()}                       # 派子代理时指定了什么模型
     if not r["present"]:
         return r
     seen = set()
+    seen_msg = set()
     for p, mtime, size, inwin in iter_jsonl(root, cutoff):
         if not inwin:
             r["older_evidence"] = True
             continue
         is_sub = (os.sep + "subagents" + os.sep) in p
         file_cwd = None
+        head = None if is_sub else {"parts": {}, "files": [], "tools": None, "listing": False, "lines": 0}
+        prev_ts, prev_model, peak, copied, file_msgs = None, None, 0, False, set()
         try:
             fh = open_log(p)
         except OSError:
@@ -435,6 +531,61 @@ def scan_claude_logs(home, cutoff):
                             vs = v.group(1).decode()
                             if ver_tuple(vs) > ver_tuple(r["version"]):
                                 r["version"] = vs
+                if head is not None:
+                    head["lines"] += 1
+                    if head["lines"] > 400:
+                        head = None
+                    elif b'"attachment"' in line or b'"api-request-shape"' in line:
+                        note_head(head, line)
+                # 每次请求的用量：输入 = 新输入 + 写入缓存 + 读缓存，就是这次请求带的全部上下文
+                if b'"usage"' in line and b'"assistant"' in line:
+                    um = USAGE_RE.search(line)
+                    mi = MSGID_RE.search(line)
+                    mid = mi.group(1) if mi else None
+                    if um and mid and mid in file_msgs:
+                        pass                             # 同一次回复被拆成几条记录，用量是同一份
+                    elif um and mid and mid in seen_msg:
+                        copied = True                    # 续接会话时抄过来的旧记录，数过了
+                    elif um:
+                        if mid:
+                            seen_msg.add(mid)
+                            file_msgs.add(mid)
+                        at = um.end()
+                        a, b_, c_ = U_IN_RE.search(line, at), U_CC_RE.search(line, at), U_CR_RE.search(line, at)
+                        cc, cr = (int(b_.group(1)) if b_ else 0), (int(c_.group(1)) if c_ else 0)
+                        ctx = (int(a.group(1)) if a else 0) + cc + cr
+                        tss = TS_RE.findall(line)
+                        uts = tss[-1].decode() if tss else ""
+                        mm = MODEL_RE.search(line)
+                        model = mm.group(1).decode("utf-8", "replace") if mm else "?"
+                        side = is_sub or b'"isSidechain":true' in line or b'"isSidechain": true' in line
+                        inwin_req = not uts or uts >= cutoff_iso
+                        if ctx and model != "<synthetic>":
+                            if inwin_req:
+                                slot = r["req"]["sub" if side else "main"].setdefault(model, {"n": 0, "tokens": 0})
+                                slot["n"] += 1
+                                slot["tokens"] += ctx
+                            if not side:
+                                if inwin_req:
+                                    b = min(ctx // CTX_BIN, 10)
+                                    r["bins"][b] += 1
+                                    r["bin_tokens"][b] += ctx
+                                    peak = max(peak, ctx)
+                                    if prev_ts is None:
+                                        if head is not None and head["listing"] and not copied:
+                                            r["starts"].append({
+                                                "ts": uts, "cwd": file_cwd or "", "tokens": ctx, "model": model,
+                                                "parts": head["parts"], "files": head["files"], "tools": head["tools"],
+                                                "skill_count": head.get("skill_count"), "deferred_n": head.get("deferred_n")})
+                                    elif ctx >= BIG_REWRITE and cr < ctx * 0.1:
+                                        gap = iso_to_ts(uts) - iso_to_ts(prev_ts) if uts and prev_ts else 0
+                                        why = ("换了模型" if model != prev_model else "隔了 1 小时以上" if gap > 3600
+                                               else "隔了 5 分钟到 1 小时" if gap > 300 else "其他原因")
+                                        w = r["rewrites"].setdefault(why, {"n": 0, "tokens": 0})
+                                        w["n"] += 1
+                                        w["tokens"] += ctx
+                                prev_ts, prev_model = uts or prev_ts or "", model
+                                head = None
                 # Claude Code 新开会话时会把发给模型的 skill 清单记进日志：这是实测值，不是我们算的
                 if not is_sub and b'"skill_listing"' in line and len(line) < 400000:
                     try:
@@ -479,8 +630,10 @@ def scan_claude_logs(home, cutoff):
                         inp = b.get("input") if isinstance(b.get("input"), dict) else {}
                         if name == "Skill" and inp.get("skill"):
                             bump(r["skill_model"], str(inp["skill"]), ts, cwd)
-                        elif name in ("Agent", "Task") and inp.get("subagent_type"):
-                            bump(r["agents"], str(inp["subagent_type"]), ts, cwd)
+                        elif name in ("Agent", "Task"):
+                            r["agent_model"][str(inp.get("model") or "")] += 1
+                            if inp.get("subagent_type"):
+                                bump(r["agents"], str(inp["subagent_type"]), ts, cwd)
                         elif name.startswith("mcp__"):
                             parts = name.split("__", 2)
                             if len(parts) == 3:
@@ -507,6 +660,8 @@ def scan_claude_logs(home, cutoff):
                         seen.add(uid)
                     for n in names:
                         bump(r["skill_user"], n, ts, cwd)
+        if peak:
+            r["peaks"].append(peak)
     return r
 
 
@@ -815,6 +970,114 @@ def ref_patterns(name):
     return re.compile(r"(?:(?<![\w/-])/%s(?![\w-])|`%s`|skills/%s(?![\w-])|「%s」|%s\s*skill)" % (e, e, e, e, e))
 
 
+def quantile(xs, q):
+    """xs 已排序。取分位数，不插值。"""
+    return xs[min(len(xs) - 1, int(len(xs) * q))] if xs else 0
+
+
+HEADING_RE = re.compile(r"^(#{1,3})\s+(.+?)\s*#*\s*$")
+
+
+def sections_of(path):
+    """按一、二、三级标题把规则文件切成几节，量每节多少字符。代码块里的 # 不算标题。"""
+    out, cur, fence = [], None, False
+    for i, ln in enumerate(read_text(path).split("\n"), 1):
+        if ln.lstrip().startswith("```"):
+            fence = not fence
+        m = None if fence else HEADING_RE.match(ln)
+        if m:
+            cur = {"title": clip(m.group(2), 40), "level": len(m.group(1)), "line": i, "chars": 0}
+            out.append(cur)
+        if cur is not None:
+            cur["chars"] += len(ln) + 1
+    return out
+
+
+SKILL_GROUPS = (
+    ("A", "一次没用，也找不到留着的理由", "可以关掉，或只留手动"),
+    ("B", "一次没用，但有理由先留着", "逐个看 ⚠ 再定，默认保留"),
+    ("C", "只有你手敲过，模型没主动调过", "适合改成「只能手动调」"),
+    ("D", "模型只主动调过一两次", "名字说得清的可以「只留名字」"),
+    ("E", "在用", "不动"),
+)
+
+
+def skill_group(s):
+    if s["total"] == 0:
+        return "B" if s["flags"] else "A"
+    if s["model_calls"] == 0 and s["codex_reads"] == 0:
+        return "C"
+    if s["model_calls"] <= 2 and s["codex_reads"] == 0:
+        return "D"
+    return "E"
+
+
+def startup_summary(starts, now):
+    """新开会话第一次请求的实测。只留统计和最近一次的明细，不把每个会话都写进 json。"""
+    if not starts:
+        return None
+    starts = sorted(starts, key=lambda s: s["ts"])
+    toks = sorted(s["tokens"] for s in starts)
+    week = iso_utc(now - 7 * 86400)
+    recent = sorted(s["tokens"] for s in starts if s["ts"] >= week)
+    by_cwd = defaultdict(list)
+    for s in starts:
+        by_cwd[s["cwd"]].append(s)
+    rows = []
+    for cwd, ss in sorted(by_cwd.items(), key=lambda kv: -len(kv[1]))[:6]:
+        t = sorted(x["tokens"] for x in ss)
+        rows.append({"cwd": cwd, "n": len(ss), "median": quantile(t, 0.5), "latest": ss[-1]["tokens"],
+                     "latest_ts": ss[-1]["ts"], "latest_parts": ss[-1]["parts"]})
+    # 拿哪一次来看明细：最近 7 天新开会话最多的那个目录里最近的一次，最能代表用户平时的开局
+    pool = [s for s in starts if s["ts"] >= week] or starts
+    busiest = Counter(s["cwd"] for s in pool).most_common(1)[0][0]
+    focus = [s for s in pool if s["cwd"] == busiest][-1]
+    return {"n": len(starts), "median": quantile(toks, 0.5), "p25": quantile(toks, 0.25), "p75": quantile(toks, 0.75),
+            "p90": quantile(toks, 0.9), "min": toks[0], "max": toks[-1],
+            "recent7": {"n": len(recent), "median": quantile(recent, 0.5)} if recent else None,
+            "latest": starts[-1], "focus": focus, "by_cwd": rows,
+            "has_shape": any(s.get("tools") is not None for s in starts)}
+
+
+def context_summary(cl):
+    bins = cl.get("bins") or Counter()
+    n = sum(bins.values())
+    if not n:
+        return None
+    tok = cl["bin_tokens"]
+    total = sum(tok.values())
+    over = {}
+    for label, b0 in (("200k", 2), ("400k", 4), ("500k", 5)):
+        over[label] = {"requests": sum(v for b, v in bins.items() if b >= b0),
+                       "tokens": sum(v for b, v in tok.items() if b >= b0)}
+    peaks = sorted(cl.get("peaks") or [])
+    rw = cl.get("rewrites") or {}
+    return {"requests": n, "tokens": total, "bins": {str(b): bins[b] for b in sorted(bins)},
+            "bin_tokens": {str(b): tok[b] for b in sorted(tok)}, "over": over,
+            "sessions": len(peaks), "peak_median": quantile(peaks, 0.5), "peak_p90": quantile(peaks, 0.9),
+            "peak_max": peaks[-1] if peaks else 0,
+            "sessions_over": {"400k": sum(1 for p in peaks if p >= 400000), "500k": sum(1 for p in peaks if p >= 500000)},
+            "rewrites": {"n": sum(v["n"] for v in rw.values()), "tokens": sum(v["tokens"] for v in rw.values()), "by": rw}}
+
+
+def auto_memory(c_dir, settings, env, cwds):
+    """Claude Code 自带的自动记忆：每个项目一份 MEMORY.md，开头 200 行或 25KB 每个会话都加载。"""
+    files = []
+    by_slug = {re.sub(r"[^A-Za-z0-9]", "-", c): c for c in cwds}      # 目录名是路径换掉符号得来的，对得上的还原成路径
+    for p in glob.glob(os.path.join(c_dir, "projects", "*", "memory", "MEMORY.md")):
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            continue
+        lines = read_text(p).count("\n") + 1
+        slug = os.path.basename(os.path.dirname(os.path.dirname(p)))
+        files.append({"path": p, "project": by_slug.get(slug), "bytes": size, "lines": lines,
+                      "over_limit": lines > 200 or size > 25000})
+    files.sort(key=lambda f: -f["bytes"])
+    off = settings.get("autoMemoryEnabled") is False or str(env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY")) == "1"
+    return {"enabled": not off, "count": len(files), "files": files[:8]}
+
+
 def do_scan(args, home):
     now = parse_now(args.now)
     cutoff = now - args.days * 86400
@@ -1003,6 +1266,29 @@ def do_scan(args, home):
     claude["broken_skill_links"] = broken_links(os.path.join(c_dir, "skills")) if has_claude else []
     claude["other_skill_calls"] = {k: v["n"] for k, v in sm.items() if k not in known}
     claude["skill_usage_source"] = bool(skill_usage)
+    # 用户级、模型看得见的 skill 按用法分成几组：几百个的时候不用一个个过
+    groups_sum = {g: {"n": 0, "desc_chars": 0} for g, _t, _a in SKILL_GROUPS}
+    for s in skills:
+        if s["scope"] == "user" and s["state"] in ("on", "name-only"):
+            s["group"] = skill_group(s)
+            groups_sum[s["group"]]["n"] += 1
+            groups_sum[s["group"]]["desc_chars"] += s["desc_chars"] if s["state"] == "on" else 0
+    claude["skill_groups"] = groups_sum
+
+    # ---- 实测：开局带了多少、会话长到多大、哪个模型在跑
+    claude["startup"] = startup_summary(cl.get("starts") or [], now)
+    claude["context"] = context_summary(cl)
+    claude["requests_by_model"] = cl.get("req") or {"main": {}, "sub": {}}
+    am = cl.get("agent_model") or Counter()
+    claude["agent_calls"] = {"total": sum(am.values()), "no_model": am.get("", 0),
+                             "by_model": {k: v for k, v in am.most_common() if k}}
+    claude["auto_memory"] = auto_memory(c_dir, settings, env, list(cl["cwds"])) if has_claude else None
+    ms = settings.get("modelSettings") if isinstance(settings.get("modelSettings"), dict) else {}
+    claude["compact_window"] = {
+        "env": env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"), "settings": settings.get("autoCompactWindow"),
+        "per_model": {k: v.get("autoCompactWindow") for k, v in ms.items()
+                      if isinstance(v, dict) and v.get("autoCompactWindow") is not None},
+        "disabled": settings.get("autoCompactEnabled") is False or str(env.get("DISABLE_AUTO_COMPACT")) == "1"}
 
     # ---- subagent
     known_agents = set()
@@ -1045,7 +1331,8 @@ def do_scan(args, home):
         val = src.get(item["key"], MISSING)
         rows.append({"key": item["key"], "where": item["where"],
                      "value": None if val is MISSING else val, "set": val is not MISSING,
-                     "default": item["default"], "what": item["what"], "source": item["source"]})
+                     "default": item["default"], "what": item["what"], "ask": item.get("ask"),
+                     "source": item["source"]})
     vt = ver_tuple(cc_version)
     dam = settings.get("disableAutoMode", MISSING)
     if dam is not MISSING and dam != "disable":
@@ -1068,7 +1355,7 @@ def do_scan(args, home):
         problems.append("bashOutputMaxChars=%s 超出 4000–128000，会被夹到范围内。" % boc)
     notes = []   # 影响常驻上下文的设置：是取舍，不是错误
     if str(env.get("ENABLE_TOOL_SEARCH", "")).lower() == "false":
-        notes.append("ENABLE_TOOL_SEARCH=false：所有 MCP 工具说明每轮都常驻上下文，不走延迟加载。")
+        notes.append("ENABLE_TOOL_SEARCH=false：工具说明（MCP 的，和一部分内置的）每轮都常驻上下文，不走「用到才加载」。删掉这个环境变量就回到默认。")
     gateway = bool(env.get("ANTHROPIC_BASE_URL")) and "anthropic.com" not in str(env.get("ANTHROPIC_BASE_URL"))
     if gateway and vt and vt < (2, 1, 181) and str(env.get("CLAUDE_CODE_ATTRIBUTION_HEADER")) != "0":
         problems.append("走自定义网关且版本低于 2.1.181：系统提示词开头带每次请求都变的标记，会破坏网关侧缓存。升级，或设 CLAUDE_CODE_ATTRIBUTION_HEADER=0。")
@@ -1233,7 +1520,10 @@ def do_scan(args, home):
                          for x, y, r_ in near]})
     ev["duplicates"] = dups
     ev["instruction_files"] = [{"path": f, "bytes": os.path.getsize(f), "rules": len(units[f]), "sha256": hashes[f],
+                                "chars": len(read_text(f)),
                                 "lines": read_text(f).count("\n") + 1, "missing_imports": missing_imports(f, home),
+                                "every_session": f in is_global,
+                                "sections": sorted(sections_of(f), key=lambda s: -s["chars"])[:6],
                                 "loaded_by": sorted(file_groups[f])} for f in all_files]
 
     # ---- 日志覆盖
@@ -1255,7 +1545,11 @@ def do_scan(args, home):
 
 
 def md(ts):
-    return ts[5:10] if ts else "—"
+    """日志里的时间是 UTC，报给用户的日期按这台电脑的本地时间。"""
+    if not ts:
+        return "—"
+    t = iso_to_ts(ts)
+    return time.strftime("%m-%d", time.localtime(t)) if t else ts[5:10]
 
 
 def render(ev, home, show_all):
@@ -1285,18 +1579,9 @@ def render(ev, home, show_all):
         L.append("注意：这个 Python 没有 tomllib（3.11 以上才有），config.toml 用简化解析，复杂写法可能读漏；set 改不了 TOML。")
 
     if c["present"]:
-        pa = c["prompt_audit"]
+        render_startup(L, c, home, days)
         L.append("")
-        L.append("== 官方 /doctor prompt-audit（查旧模型写法、失效路径、互相矛盾的规则）==")
-        L.append("能不能调：%s" % {True: "能", False: "现在不能", None: "不确定"}[pa["available"]])
-        for ck in pa["checks"]:
-            L.append("  - " + ck)
-        if pa["available"] is not True:
-            of = pa.get("official_file")
-            L.append("调不了也能做：直接读官方那份说明文件照着做，不用为此改设置。")
-            if of:
-                L.append("  本机副本：%s（文件日期 %s）" % (show(of["path"], home), of["date"]))
-            L.append("  原文：%s" % pa["official_url"])
+        L.append("######## 二、清理：每次请求都带着、可以拿掉的东西 ########")
 
         sk = c["skills"]
         usr = [s for s in sk if s["scope"] == "user"]
@@ -1316,12 +1601,12 @@ def render(ev, home, show_all):
             L.append("日志实记：最近一次新开会话（%s，%s）发给模型的 skill 清单是 %d 个、%d 字符；窗口内 %d 次新开会话，最少 %d 个、最多 %d 个。" % (
                 md(la["ts"]), show(la["cwd"], home) if la["cwd"] else "目录未知", la["count"], la["chars"],
                 ls["samples"], ls["min"], ls["max"]))
-            L.append("  这个数是 Claude Code 自己记的，包含内置、插件和当前项目的 skill，所以比上面的用户级个数多。改完配置后新开一个会话再扫，用它核对。")
+            L.append("  这个数是 Claude Code 自己记的：内置、插件和当前项目的 skill 也算在里面，字符数里除了描述还有每个 skill 的名字。改完配置后新开一个会话再扫，用它核对。")
         for b in c.get("broken_skill_links") or []:
             L.append("⚠ 软链断了：%s → %s（目标不存在，这个入口已经用不了）" % (show(b["path"], home), b["target"]))
         hidden = [s for s in usr if s["state"] not in ("on", "name-only")]
         if hidden:
-            L.append("模型看不见的 %d 个：%s" % (len(hidden), "、".join("%s（%s）" % (s["dir"], "仅手动" if s["state"] == "user-invocable-only" else s["state"]) for s in hidden[:40])))
+            L.append("模型看不见的 %d 个：%s" % (len(hidden), "、".join("%s（%s）" % (s["dir"], "仅手动" if s["state"] == "user-invocable-only" else s["state"]) for s in hidden[:12]) + ("…（完整名单在 json 里）" if len(hidden) > 12 else "")))
         L.append("次数怎么数的：「模型调」是模型用 Skill 工具调用，「手敲」是用户输入 /名字，「Codex 读」是 Codex 按路径读了这个 skill 的 SKILL.md。")
 
         def where(s):
@@ -1344,9 +1629,23 @@ def render(ev, home, show_all):
 
         idle = sorted([s for s in visible if s["total"] == 0], key=lambda s: -s["desc_chars"])
         L.append("用户级里近 %d 天 0 次调用、还对模型可见的：%d 个（候选，不是结论）" % (days, len(idle)))
-        L.extend(idle_line(s) for s in idle[:cap])
-        if len(idle) > cap:
-            L.append("  …还有 %d 个，加 --all 看全部" % (len(idle) - cap))
+        gs = c.get("skill_groups") or {}
+        gcap = cap if show_all else 8
+        L.append("模型看得见的 %d 个，按近 %d 天的用法分组（组里的完整名单：slim show --scan <json> --group 字母）：" % (len(visible), days))
+        for g, title, advice in SKILL_GROUPS:
+            members = sorted([s for s in visible if s.get("group") == g], key=lambda s: (-s["desc_chars"], s["dir"]))
+            if not members:
+                continue
+            L.append("  %s 组 %d 个，描述合计 %d 字符：%s → %s" % (g, len(members), gs.get(g, {}).get("desc_chars", 0), title, advice))
+            if g == "E":
+                continue                      # 在用的在下面「用过的」里列
+            if g in ("A", "B"):
+                L.extend("  " + idle_line(s) for s in members[:gcap])
+            else:
+                L.extend("    - %s [描述 %d 字符]：手敲 %d，模型调 %d，最近 %s" % (
+                    s["dir"], s["desc_chars"], s["user_calls"], s["model_calls"], md(s["last"])) for s in members[:gcap])
+            if len(members) > gcap:
+                L.append("      …还有 %d 个" % (len(members) - gcap))
         idle_p = sorted([s for s in prj if s["total"] == 0 and s["state"] in ("on", "name-only")], key=lambda s: -s["desc_chars"])
         if idle_p:
             L.append("项目级里 0 次调用的：%d 个" % len(idle_p))
@@ -1369,12 +1668,13 @@ def render(ev, home, show_all):
 
         # 和用户级同名的项目级 skill 次数是合在一起的，只列用户级那一行，免得看成两份各用了这么多次
         busy = sorted([s for s in sk if s["total"] > 0 and not s.get("twin")], key=lambda s: -s["total"])
-        top = 10 ** 6 if show_all else 12
+        many = len(busy) > 40      # 用过的很多时只列几个，名单在 json 里；重点留给上面的分组
+        top = 10 ** 6 if show_all else (6 if many else 12)
         shown = 0
         L.append("用过的：%d 个（下面列调用最多的，以及状态或用法值得一提的）" % len(busy))
         for i, s in enumerate(busy):
             notable, text = busy_line(s)
-            if i < top or (notable and shown < top + cap):
+            if i < top or (notable and shown < top + (cap if show_all else (2 if many else 6))):
                 L.append(text)
                 shown += 1
         if len(busy) > shown:
@@ -1436,21 +1736,40 @@ def render(ev, home, show_all):
             L.append("自定义 agent：%s（v1 不统计 Codex agent 的调用次数）" % "、".join(x["agents"]))
 
     L.append("")
-    L.append("== 重复规则 ==")
+    L.append("== 规则文件 ==")
+    L.append("规则文件（CLAUDE.md、AGENTS.md、rules/ 下的文件）在会话一开始就整份加载，之后每次请求都带着。越大的越值得先看。")
     if ev["instruction_files"]:
-        L.append("查了这些规则文件（内容完全相同的只列一次）：")
+        L.append("查了这些规则文件（从大到小；内容完全相同的只列一次）：")
         by_hash = {}
         for f in ev["instruction_files"]:
             by_hash.setdefault(f["sha256"], []).append(f)
         rows = [fs for fs in by_hash.values() if fs[0]["rules"]]     # 只有一行 @import 的指针文件不列
-        for fs in rows[:cap]:
+        rows.sort(key=lambda fs: -fs[0]["bytes"])
+        for i, fs in enumerate(rows[:cap]):
             f = fs[0]
-            L.append("  - %s（%d 字节，%d 行，%d 条）%s%s" % (
-                show(f["path"], home), f["bytes"], f.get("lines", 0), f["rules"],
+            L.append("  - %s（%d 字符，%d 字节，%d 行，%d 条）%s%s%s" % (
+                show(f["path"], home), f.get("chars", 0), f["bytes"], f.get("lines", 0), f["rules"],
+                ("  每个会话都加载" if f.get("every_session") else "") + ("  Codex 读的" if os.path.basename(f["path"]).startswith("AGENTS") else ""),
                 "，另有 %d 份相同" % (len(fs) - 1) if len(fs) > 1 else "",
                 "  超过官方建议的 200 行" if f.get("lines", 0) > 200 and os.path.basename(f["path"]).startswith("CLAUDE") else ""))
+            secs = [s for s in f.get("sections") or [] if s["chars"] >= 800][:4]
+            if f.get("chars", 0) >= 4000 and secs and (i < 5 or f.get("every_session") or show_all):
+                L.append("      最大的几节：" + "；".join("「%s」%d 字符（第 %d 行起）" % (s["title"], s["chars"], s["line"]) for s in secs))
         if len(rows) > cap:
             L.append("  …还有 %d 个，加 --all 或看 --json" % (len(rows) - cap))
+    mem = c.get("auto_memory") if c["present"] else None
+    if mem and mem["count"]:
+        L.append("Claude Code 自带的自动记忆：%s，%d 个项目有 MEMORY.md。它的开头 200 行或 25KB 在那个项目的每个会话里都加载，上面开局账单的「规则文件」一行不含它。最大的几份：" % (
+            "开着" if mem["enabled"] else "已关", mem["count"]))
+        for f in mem["files"][:4]:
+            L.append("  - %s（%d 字节，%d 行）%s" % (
+                "项目 %s 的 MEMORY.md" % show(f["project"], home) if f.get("project") else show(f["path"], home), f["bytes"], f["lines"],
+                                               "  超过 200 行或 25KB，后面的部分开局读不到" if f["over_limit"] else ""))
+    elif mem:
+        L.append("Claude Code 自带的自动记忆：%s，还没有记下任何 MEMORY.md。" % ("开着" if mem["enabled"] else "已关"))
+    L.append("")
+    L.append("== 重复规则 ==")
+    if ev["instruction_files"]:
         dead = [(f["path"], t) for f in ev["instruction_files"] for t in f.get("missing_imports") or []]
         if dead:
             L.append("写了 @引用、但文件不存在的（候选，先确认是不是引用）：")
@@ -1500,6 +1819,10 @@ def render(ev, home, show_all):
         L.append("（有 %d 组项目目录的规则文件内容完全相同，多半是同一个仓库的 worktree，共 %d 个目录，每组只算一次。）" % (len(grouped), sum(len(p["same_as"]) + 1 for p in grouped)))
 
     L.append("")
+    L.append("######## 三、配置：不删东西，只改几个设置 ########")
+    if c["present"]:
+        render_config(L, c, days)
+    L.append("")
     L.append("== 开关 ==")
     probs = (c.get("problems") or []) + (x.get("problems") or [])
     if probs:
@@ -1512,6 +1835,14 @@ def render(ev, home, show_all):
         L.append("影响常驻上下文的设置（是取舍，不是错误）：")
         for p in c["notes"]:
             L.append("  · " + p)
+    if c["present"]:
+        walk = [r for r in c["switches"] if r.get("ask")]
+        if walk:
+            L.append("值得和用户过一遍的几个（每个都是取舍，讲清楚再由他定）：")
+            for r in walk:
+                L.append("  ? %s，现在是 %s，默认 %s" % (
+                    r["key"], json.dumps(r["value"], ensure_ascii=False) if r["set"] else "没设", r["default"]))
+                L.append("      " + r["ask"])
     L.append("下面是取舍项，只列事实，不代表建议改：")
     unset = []
     if c["present"]:
@@ -1533,12 +1864,177 @@ def render(ev, home, show_all):
         L.append("  没设、用默认值的：" + "、".join(unset))
     L.append("每个键管什么、默认是什么、出处在哪：%s" % SWITCHES)
 
+    if c["present"]:
+        pa = c["prompt_audit"]
+        L.append("")
+        L.append("== 官方 /doctor prompt-audit（查旧模型写法、失效路径、互相矛盾的规则）==")
+        L.append("能不能调：%s" % {True: "能", False: "现在不能", None: "不确定"}[pa["available"]])
+        for ck in pa["checks"]:
+            L.append("  - " + ck)
+        if pa["available"] is not True:
+            of = pa.get("official_file")
+            L.append("调不了也能做：直接读官方那份说明文件照着做，不用为此改设置。")
+            if of:
+                L.append("  本机副本：%s（文件日期 %s）" % (show(of["path"], home), of["date"]))
+            L.append("  原文：%s" % pa["official_url"])
+
     if ev["backups"]:
         L.append("")
         L.append("== 之前的备份 ==")
         for b in ev["backups"][-5:]:
             L.append("  - %s [%s] %s" % (b["id"], b["state"], b["note"] or ""))
     return "\n".join(L)
+
+
+def num(n):
+    return "{:,}".format(int(n))
+
+
+def wan(n):
+    """token 数用「万」说：82,300 → 8.2 万。"""
+    n = int(n)
+    if n >= 100000000:
+        return "%.1f 亿" % (n / 100000000.0)
+    if n >= 10000:
+        return "%.1f 万" % (n / 10000.0)
+    return num(n)
+
+
+def pct(part, whole):
+    v = part * 100.0 / max(whole, 1)
+    return "不到 0.1%" if 0 < v < 0.05 else "占 %.1f%%" % v
+
+
+PART_NAMES = (
+    ("rules", "规则文件"), ("skills", "skill 清单"), ("mcp_tools", "MCP 工具说明"), ("builtin_tools", "内置工具说明"),
+    ("system", "系统提示"), ("hooks", "会话开始时 hook 塞进来的内容"), ("mcp_notes", "MCP 自带的使用说明"),
+    ("deferred", "延迟加载的工具名单"), ("agents", "subagent 名单"), ("other", "其他附带信息（环境、沙箱说明等）"),
+)
+PART_CAN = {
+    "rules": "能瘦：见下面「规则文件」", "skills": "能减：见下面「Skill」", "mcp_tools": "能减：停掉不用的 MCP；想留着的，看「开关」里 ENABLE_TOOL_SEARCH 是不是被设成了 false",
+    "builtin_tools": "基本是固定的", "system": "固定的", "hooks": "看 hook 是不是还需要", "mcp_notes": "停掉不用的 MCP 就没了",
+    "deferred": "停掉不用的 MCP 会变短", "agents": "删掉不用的 subagent 会变短", "other": "基本是固定的",
+}
+
+
+def render_startup(L, c, home, days):
+    st = c.get("startup")
+    L.append("")
+    L.append("######## 一、开局：新开一个会话，第一句话还没答，已经带了多少 ########")
+    if not st:
+        L.append("日志里没找到新开会话的记录（Claude Code 版本太旧，或窗口内没有新会话），这一块量不出来。")
+        L.append("替代办法：让用户新开一个会话，什么都不说，直接输入 /context，把结果贴过来。")
+        return
+    if st["n"] < 5:
+        # 样本太少时不报中位数和分位数，免得一个数被说三遍
+        L.append("实测（Claude Code 自己记在日志里的用量，不是估的）：近 %d 天日志里只有 %d 个新会话，第一次请求的输入在 %s 到 %s token 之间。" % (
+            days, st["n"], num(st["min"]), num(st["max"])) if st["min"] != st["max"] else
+            "实测（Claude Code 自己记在日志里的用量，不是估的）：近 %d 天日志里只有 %d 个新会话。" % (days, st["n"]))
+    else:
+        L.append("实测（Claude Code 自己记在日志里的用量，不是估的）：近 %d 天 %d 个新会话，第一次请求的输入中位数 %s token，最少 %s，九成在 %s 以内。" % (
+            days, st["n"], num(st["median"]), num(st["min"]), num(st.get("p90", st["max"]))))
+    if st.get("recent7") and st["n"] >= 5:
+        L.append("最近 7 天：%d 个新会话，中位数 %s token。" % (st["recent7"]["n"], num(st["recent7"]["median"])))
+    if len(st["by_cwd"]) > 1:
+        L.append("按目录（开局大小跟着项目的规则文件、项目级 skill 和 MCP 变）：")
+        for r in st["by_cwd"]:
+            L.append("  - %s：%d 个新会话，中位数 %s，最近一次 %s（%s）" % (
+                show(r["cwd"], home) if r["cwd"] else "目录未知", r["n"], num(r["median"]), num(r["latest"]), md(r["latest_ts"])))
+    la = st.get("focus") or st["latest"]
+    parts = la.get("parts") or {}
+    total = sum(parts.values())
+    L.append("拿最近常用的目录里最近一次新开会话来看（%s，%s，%s）：第一次请求 %s token。" % (
+        md(la["ts"]), show(la["cwd"], home) if la["cwd"] else "目录未知", la["model"], num(la["tokens"])))
+    if not total:
+        L.append("  这个版本的日志没有记这次请求里各部分的大小，分不出明细。")
+    else:
+        L.append("  这次请求里各部分的大小（字符数，从大到小；占比按字符算，中文和英文折成 token 的比例不同，只用来排先后）：")
+        for key, v in sorted(parts.items(), key=lambda kv: -kv[1]):
+            if not v:
+                continue
+            name = dict(PART_NAMES).get(key, key)
+            extra = ""
+            if key == "skills" and la.get("skill_count"):
+                extra = " %d 个" % la["skill_count"]
+            elif key == "rules":
+                extra = " %d 个" % len(la.get("files") or [])
+            elif key == "builtin_tools" and la.get("tools"):
+                extra = " %d 个" % la["tools"]["builtin"]["n"]
+            elif key == "mcp_tools" and la.get("tools"):
+                extra = " %d 个" % sum(v_["n"] for v_ in la["tools"]["mcp"].values())
+            elif key == "deferred" and la.get("deferred_n"):
+                extra = " %d 个" % la["deferred_n"]
+            can = PART_CAN.get(key, "")
+            if key == "builtin_tools" and not la.get("deferred_n") and any("ENABLE_TOOL_SEARCH=false" in str(x) for x in c.get("notes") or []):
+                # 实测（2.1.321）：这个开关设成 false 时，本来「用到才加载」的那部分内置工具也整份带上
+                can = "能减：ENABLE_TOOL_SEARCH 被设成了 false，所有工具的说明都整份带上了；改回默认后一部分工具用到才加载"
+            L.append("  %5.1f%%  %8s 字符  %s%s  —— %s" % (v * 100.0 / total, num(v), name, extra, can))
+            if key == "rules":
+                for f in sorted(la.get("files") or [], key=lambda f: -f["chars"])[:6]:
+                    L.append("             · %s 字符  %s" % (num(f["chars"]), show(f["path"], home)))
+            if key == "mcp_tools" and la.get("tools"):
+                for srv, v_ in sorted(la["tools"]["mcp"].items(), key=lambda kv: -kv[1]["chars"])[:6]:
+                    L.append("             · %s 字符  %s（%d 个工具）" % (num(v_["chars"]), srv, v_["n"]))
+        if la.get("tools") is None:
+            L.append("  （这个版本的日志没记系统提示和工具说明的大小，上面只有其余部分。）")
+    L.append("怎么用这一块：先砍排在前面、而且「能瘦」「能减」的。改完后新开一个会话说一句话，再扫一次，对比这里的第一次请求 token。")
+
+
+def render_config(L, c, days):
+    cx = c.get("context")
+    cw = c.get("compact_window") or {}
+    L.append("")
+    L.append("== 自动压缩窗口（会话长到多大就自动压缩）==")
+    if cw.get("disabled"):
+        cur = "自动压缩被关掉了（autoCompactEnabled=false 或 DISABLE_AUTO_COMPACT=1）"
+    elif cw.get("env") is not None:
+        cur = "环境变量 CLAUDE_CODE_AUTO_COMPACT_WINDOW=%s" % cw["env"]
+    elif cw.get("settings") is not None:
+        cur = "autoCompactWindow=%s" % cw["settings"]
+    else:
+        cur = "没设，Claude Code 按模型自己定"
+    if cw.get("per_model"):
+        cur += "；另外 /autocompact 给这些模型单独设过：" + "、".join("%s=%s" % kv for kv in cw["per_model"].items())
+    L.append("现在的设置：%s。" % cur)
+    if cx:
+        L.append("实测：近 %d 天主会话 %s 次请求，一共带了 %s token 的上下文（每次请求都把当时的整段历史带一遍）。" % (
+            days, num(cx["requests"]), wan(cx["tokens"])))
+        for label, name in (("200k", "20 万"), ("400k", "40 万"), ("500k", "50 万")):
+            o = cx["over"][label]
+            if o["requests"]:
+                L.append("  上下文超过 %s的请求：%s 次（%s），带了 %s token（%s）" % (
+                    name, num(o["requests"]), pct(o["requests"], cx["requests"]), wan(o["tokens"]), pct(o["tokens"], cx["tokens"])))
+        L.append("  %d 个会话里，最长的那次请求：中位数 %s，九成在 %s 以内，最大 %s；超过 40 万的会话 %d 个，超过 50 万的 %d 个。" % (
+            cx["sessions"], wan(cx["peak_median"]), wan(cx["peak_p90"]), wan(cx["peak_max"]),
+            cx["sessions_over"]["400k"], cx["sessions_over"]["500k"]))
+        L.append("  怎么读：窗口设成 40 万或 50 万，上面「超过」的那些请求就不会再带那么长的历史；代价是压缩得更早，压缩后模型手里只有摘要。")
+    else:
+        L.append("日志里没有用量记录，量不出会话实际长到多大。")
+    L.append("")
+    L.append("== 缓存：放着不动再回来 ==")
+    rw = (cx or {}).get("rewrites") or {"n": 0}
+    if rw["n"]:
+        L.append("实测：近 %d 天有 %s 次请求没命中缓存，把 10 万 token 以上的历史整段重算了一遍，合计 %s token。" % (days, num(rw["n"]), wan(rw["tokens"])))
+        for why, v in sorted(rw["by"].items(), key=lambda kv: -kv[1]["tokens"]):
+            L.append("  - %s：%s 次，%s token" % (why, num(v["n"]), wan(v["tokens"])))
+        L.append("  怎么读：缓存有时效（订阅用户的主会话 1 小时，其余 5 分钟）。隔久了再回来，第一句话要把整段历史按全价重算。离开前先 /compact，或者回来时新开会话，这一笔就小得多。")
+    elif cx:
+        L.append("近 %d 天没看到「10 万 token 以上的历史整段重算」的请求。" % days)
+    L.append("")
+    L.append("== 子代理用什么模型 ==")
+    rq = c.get("requests_by_model") or {}
+    for kind, name in (("main", "主会话"), ("sub", "子代理")):
+        rows = sorted((rq.get(kind) or {}).items(), key=lambda kv: -kv[1]["tokens"])
+        if rows:
+            L.append("%s：%s" % (name, "；".join("%s %s 次、%s token" % (m, num(v["n"]), wan(v["tokens"])) for m, v in rows[:5])))
+    ac = c.get("agent_calls") or {}
+    if ac.get("total"):
+        L.append("派子代理 %s 次：其中 %s 次没指定模型（跟主会话用同一个）%s。" % (
+            num(ac["total"]), num(ac["no_model"]),
+            "，指定了的：" + "、".join("%s %d" % kv for kv in list(ac["by_model"].items())[:5]) if ac["by_model"] else ""))
+        L.append("  怎么读：查资料、搜文件、读日志这类活用便宜的模型就够。没指定模型的子代理会用主会话那个最贵的。")
+    elif not (rq.get("sub")):
+        L.append("近 %d 天没有派过子代理。" % days)
 
 
 # ---------------------------------------------------------------- 备份 / 回滚
@@ -1988,23 +2484,38 @@ def redacted(path, v):
     return clip(json.dumps(v, ensure_ascii=False), 80)
 
 
+def check_path(path):
+    if not isinstance(path, list) or not path or not all(isinstance(k, (str, dict)) for k in path):
+        die("--path 要写成 JSON 数组，元素是键名（字符串）或选择条件（对象）。")
+
+
 def cmd_set(args, home):
-    m = load_manifest(home, args.backup)
-    require_open(m)
-    full = resolve_target(expand(args.file, home), m["roots"], home)
-    _i, e = entry_for(m, full)
-    if e is None:
-        die("%s 不在备份 %s 里。先把它加进一个新的 backup 再改。" % (show(full, home), m["id"]))
-    if os.path.islink(full):
-        die("%s 是软链。要改就改它指向的真实文件（并确保真实文件在备份里）。" % show(full, home))
-    if e["pre"]["kind"] not in ("file", "absent"):
-        die("%s 不是文件。" % show(full, home))
+    many = getattr(args, "many", None)
+    if many:
+        args.many = many
+        if args.path or args.value is not None or args.delete:
+            die("--many 和 --path / --value / --delete 不能一起用。")
+        try:
+            with open(args.many, "r", encoding="utf-8-sig") as f:
+                items = json.load(f)
+        except (OSError, ValueError) as e:
+            die("--many 的文件读不了或不是 JSON：%s" % e)
+        if not isinstance(items, list) or not items:
+            die("--many 的文件要是一个 JSON 数组，每项形如 {\"path\": [...], \"value\": ...} 或 {\"path\": [...], \"delete\": true}。")
+        edits = []
+        for it in items:
+            if not isinstance(it, dict) or ("value" in it) == bool(it.get("delete")):
+                die("--many 里每一项要有 path，再加 value 或 \"delete\": true 其中一个。")
+            check_path(it.get("path"))
+            edits.append((it["path"], it.get("value"), bool(it.get("delete"))))
+        return apply_edits(home, args.backup, args.file, edits)
+    if not args.path:
+        die("要给 --path（改一个键），或 --many（一次改很多个键）。")
     try:
         path = json.loads(args.path)
     except ValueError:
         die("--path 要写成 JSON 数组，例如 '[\"skillOverrides\",\"deploy\"]'。")
-    if not isinstance(path, list) or not path or not all(isinstance(k, (str, dict)) for k in path):
-        die("--path 要写成 JSON 数组，元素是键名（字符串）或选择条件（对象）。")
+    check_path(path)
     if args.delete == (args.value is not None):
         die("--value 和 --delete 二选一。")
     value = None
@@ -2013,6 +2524,101 @@ def cmd_set(args, home):
             value = json.loads(args.value)
         except ValueError:
             die("--value 要写成 JSON，例如 '\"off\"'、false、350000。")
+    apply_edits(home, args.backup, args.file, [(path, value, bool(args.delete))])
+
+
+SKILL_STATES = {"off": "off", "关掉": "off", "manual": "user-invocable-only", "user-invocable-only": "user-invocable-only",
+                "只能手动调": "user-invocable-only", "name": "name-only", "name-only": "name-only", "只留名字": "name-only",
+                "on": "on", "保留": "on"}
+
+
+def group_members(scan_path, group):
+    ev, err = load_json_file(scan_path)
+    if not isinstance(ev, dict) or "claude" not in ev:
+        die("%s 不是 scan --json 写出的文件（%s）。" % (scan_path, err or "格式不对"))
+    return [s for s in ev["claude"].get("skills") or [] if s.get("group") == group.upper()], ev
+
+
+def cmd_skills(args, home):
+    """一次改很多个 skill 的状态：整组，或点名的几个。只动 settings.json 的 skillOverrides，skill 文件不碰。"""
+    state = SKILL_STATES.get(args.state)
+    if not state:
+        die("--state 取 off（关掉）、manual（只能手动调）、name（只留名字）、on（保留）之一。")
+    names = list(args.names or [])
+    # 点名的名字先核对一遍：拼错的名字写进 skillOverrides 不会报错，只会悄悄不生效
+    known = None
+    if args.scan:
+        ev0, err = load_json_file(args.scan)
+        if not isinstance(ev0, dict) or "claude" not in ev0:
+            die("%s 不是 scan --json 写出的文件（%s）。" % (args.scan, err or "格式不对"))
+        known = set(s["name"] for s in ev0["claude"].get("skills") or [])
+    else:
+        sd = os.path.join(claude_dir(home), "skills")
+        if os.path.isdir(sd):
+            known = set(os.listdir(sd))
+            cur, _e = load_json_file(os.path.join(claude_dir(home), "settings.json"))
+            if isinstance(cur, dict) and isinstance(cur.get("skillOverrides"), dict):
+                known |= set(cur["skillOverrides"])
+    if known is not None:
+        bad = [n for n in names if n not in known]
+        if bad:
+            die("找不到这些 skill：%s。没有改。检查拼写；项目级、插件里的 skill 加 --scan <json> 按扫描到的名单核对；Claude Code 内置的 skill 用 slim set 改 skillOverrides。" % "、".join(bad))
+    if args.group:
+        if not args.scan:
+            die("用 --group 要同时给 --scan <scan --json 写出的文件>。")
+        if args.group.upper() not in ("A", "B", "C", "D"):
+            die("--group 取 A、B、C、D 之一。E 组是在用的，不整组改；要改其中某个就点名。")
+        members, _ev = group_members(args.scan, args.group)
+        names += [s["name"] for s in members]
+    skip = set(args.exclude or [])
+    stray = [n for n in skip if n not in names]
+    if stray:
+        die("--exclude 里的 %s 不在这次要改的名单里（是不是拼错了）。没有改。" % "、".join(sorted(stray)))
+    names = [n for i, n in enumerate(names) if n not in skip and n not in names[:i]]
+    if not names:
+        die("没有要改的 skill：给名字，或给 --scan 加 --group。")
+    edits = [(["skillOverrides", n], state, False) for n in names]
+    apply_edits(home, args.backup, os.path.join(claude_dir(home), "settings.json"), edits,
+                summary="%d 个 skill 改成 %s" % (len(names), state))
+
+
+def cmd_show(args, home):
+    """从上次 scan 的 json 里取一组 skill 的完整名单，不用重扫。"""
+    members, ev = group_members(args.scan, args.group)
+    title = dict((g, t) for g, t, _a in SKILL_GROUPS).get(args.group.upper())
+    if not title:
+        die("--group 取 A、B、C、D、E 之一。")
+    members.sort(key=lambda s: (-s["desc_chars"], s["dir"]))
+    if args.names:
+        print(" ".join(s["name"] for s in members))
+        return
+    print("%s 组 %d 个：%s（近 %d 天）" % (args.group.upper(), len(members), title, ev.get("days", 30)))
+    for s in members:
+        bits = ["描述 %d 字符" % s["desc_chars"], "手敲 %d" % s["user_calls"], "模型调 %d" % s["model_calls"]]
+        if s.get("codex_reads"):
+            bits.append("Codex 读 %d" % s["codex_reads"])
+        if s.get("flags"):
+            bits.append("⚠ " + "；".join(s["flags"]))
+        if s.get("referenced_by"):
+            bits.append("引用它的：" + "、".join(show(p, home) for p in s["referenced_by"][:2]))
+        print("  - %s [%s]" % (s["name"], "，".join(bits)))
+
+
+def apply_edits(home, backup_id, file_arg, edits, summary=None):
+    """对同一个 JSON / TOML 文件做一批改动，全部成功才写回一次；任何一项被拒，文件不动。"""
+    for path, value, delete in edits:
+        if path == ["autoCompactWindow"] and not delete and not (isinstance(value, int) and not isinstance(value, bool) and 100000 <= value <= 1000000):
+            die("autoCompactWindow 要是 100000 到 1000000 之间的整数，收到的是 %s。没有改。" % json.dumps(value, ensure_ascii=False))
+    m = load_manifest(home, backup_id)
+    require_open(m)
+    full = resolve_target(expand(file_arg, home), m["roots"], home)
+    _i, e = entry_for(m, full)
+    if e is None:
+        die("%s 不在备份 %s 里。先把它加进一个新的 backup 再改。" % (show(full, home), m["id"]))
+    if os.path.islink(full):
+        die("%s 是软链。要改就改它指向的真实文件（并确保真实文件在备份里）。" % show(full, home))
+    if e["pre"]["kind"] not in ("file", "absent"):
+        die("%s 不是文件。" % show(full, home))
     exists = os.path.isfile(full)
     text = ""
     if exists:
@@ -2024,24 +2630,37 @@ def cmd_set(args, home):
             die("%s 不是 UTF-8 编码（可能是 GBK），脚本不改，请手动改。" % show(full, home))
     bom = chr(0xFEFF) if text.startswith(chr(0xFEFF)) else ""   # Windows 记事本可能加 BOM，原样保留
     body = text[len(bom):]
-    if full.endswith(".toml"):
-        new, old = toml_edit(body, path, value, args.delete)
-    elif full.endswith(".json"):
-        new, old = json_edit(body, path, value, args.delete)
-    else:
+    if not (full.endswith(".toml") or full.endswith(".json")):
         die("set 只改 .json 和 .toml。别的文件请直接编辑，改动仍在备份保护内。")
-    new = bom + new
-    label = ".".join(k if isinstance(k, str) else json.dumps(k, ensure_ascii=False) for k in path)
-    if new == text:
-        print("没有变化：%s 里 %s 已经是这个值。" % (show(full, home), label))
+    edit = toml_edit if full.endswith(".toml") else json_edit
+    done = []
+    for path, value, delete in edits:
+        before = body
+        body, old = edit(body, path, value, delete)
+        label = ".".join(k if isinstance(k, str) else json.dumps(k, ensure_ascii=False) for k in path)
+        if body != before:
+            done.append((path, label, old, value, delete))
+    if not done:
+        print("没有变化：%s 里%s已经是这个值。" % (show(full, home), " " + label + " " if len(edits) == 1 else "这 %d 项" % len(edits)))
         return
     mode = stat.S_IMODE(os.lstat(full).st_mode) if exists else 0o600
     track_makedirs(m, os.path.dirname(full))
-    atomic_write(full, new, mode)
-    m["ops"].append({"op": "set", "file": full, "path": path, "delete": bool(args.delete),
-                     "old": redacted(path, old), "new": "（删除）" if args.delete else redacted(path, value)})
+    atomic_write(full, bom + body, mode)
+    for path, label, old, value, delete in done:
+        m["ops"].append({"op": "set", "file": full, "path": path, "delete": bool(delete),
+                         "old": redacted(path, old), "new": "（删除）" if delete else redacted(path, value)})
     save_manifest(home, m)
-    print("已改 %s：%s  %s → %s" % (show(full, home), label, redacted(path, old), "（删除）" if args.delete else redacted(path, value)))
+    if len(edits) == 1:
+        path, label, old, value, delete = done[0]
+        print("已改 %s：%s  %s → %s" % (show(full, home), label, redacted(path, old), "（删除）" if delete else redacted(path, value)))
+        return
+    same = len(edits) - len(done)
+    print("已改 %s：%s%s，一次写回。" % (show(full, home), summary or "%d 项" % len(edits),
+                                  "，其中 %d 项本来就是这个值，实际变了 %d 项" % (same, len(done)) if same else ""))
+    for path, label, old, value, delete in done[:12]:
+        print("  %s  %s → %s" % (label, redacted(path, old), "（删除）" if delete else redacted(path, value)))
+    if len(done) > 12:
+        print("  …还有 %d 项，完整清单看 slim list" % (len(done) - 12))
 
 
 def cmd_move(args, home):
@@ -2052,7 +2671,7 @@ def cmd_move(args, home):
     _i, es = entry_for(m, src)
     _j, ed = entry_for(m, dst)
     if es is None or ed is None:
-        die("src 和 dst 都要先列进 backup 的 --paths（dst 现在不存在也要列）。")
+        die("src 和 dst 都要先列进 backup 的 --paths（dst 现在不存在也要列）。dst 要写搬过去之后的完整路径，含最后那一级名字，不是它的上级目录。")
     if not os.path.lexists(src):
         die("%s 不存在。" % show(src, home))
     if os.path.lexists(dst):
@@ -2235,6 +2854,58 @@ def cmd_status(args, home):
         print("自上次扫描以来，扫描过的配置和规则文件都没变。")
 
 
+def cmd_compare(args, home):
+    """改之前和改之后各一份 scan 的 json，对比新开会话第一次请求的实测用量。只读。"""
+    evs = []
+    for p in (args.before, args.after):
+        ev, err = load_json_file(p)
+        if not isinstance(ev, dict) or "claude" not in ev:
+            die("读不了 scan 的 JSON（%s：%s）。" % (p, err))
+        evs.append(ev)
+    sb, sa = [(e.get("claude") or {}).get("startup") for e in evs]
+    if not sb or not sa:
+        die("%s那份扫描里没有新开会话的记录，比不了。新开一个会话说一句话，再 scan --json 一次。" % ("改之前" if not sb else "改之后"))
+    a = sa["latest"]
+    b = sb["latest"]
+    if a["cwd"] != b["cwd"]:
+        row = [r for r in sb.get("by_cwd") or [] if r["cwd"] == a["cwd"]]
+        if row:
+            b = {"ts": row[0]["latest_ts"], "cwd": a["cwd"], "tokens": row[0]["latest"], "parts": row[0]["latest_parts"], "model": None}
+    if a["ts"] <= b["ts"]:
+        die("改之后那份扫描里，最近一次新开会话还是改之前的那一次（%s）。改动只在新开的会话里生效：新开一个会话说一句话，再 scan --json 一次。" % md(a["ts"]))
+    L = ["前后对比：新开一个会话，第一次请求带了多少（Claude Code 自己记在日志里的用量，不是估的）", ""]
+    L.append("  改之前  %s token   （%s，%s%s）" % (num(b["tokens"]).rjust(9), md(b["ts"]), show(b["cwd"], home), "，" + b["model"] if b.get("model") else ""))
+    L.append("  改之后  %s token   （%s，%s%s）" % (num(a["tokens"]).rjust(9), md(a["ts"]), show(a["cwd"], home), "，" + a["model"] if a.get("model") else ""))
+    d = b["tokens"] - a["tokens"]
+    if d > 0:
+        L.append("  少了    %s token   （现在是原来的 %.0f%%）" % (num(d).rjust(9), 100.0 * a["tokens"] / b["tokens"]))
+    elif d < 0:
+        L.append("  多了    %s token" % num(-d).rjust(9))
+    else:
+        L.append("  没变")
+    if a["cwd"] != b["cwd"]:
+        L.append("  注意：两次不在同一个目录，项目级的规则和 skill 不一样，数字只能粗看。在同一个目录新开会话再比才准。")
+    if a.get("model") and b.get("model") and a["model"] != b["model"]:
+        L.append("  注意：两次用的模型不一样，同样的内容折出来的 token 数会有出入。")
+    L.append("")
+    L.append("各部分的大小（字符数）：")
+    L.append("  %s  %s  %s" % ("改之前".rjust(8), "改之后".rjust(8), ""))
+    pb, pa = b.get("parts") or {}, a.get("parts") or {}
+    for key, name in PART_NAMES:
+        x, y = pb.get(key, 0), pa.get(key, 0)
+        if not x and not y:
+            continue
+        extra = ""
+        if key == "skills" and b.get("skill_count") is not None and a.get("skill_count") is not None:
+            extra = "（%d 个 → %d 个）" % (b["skill_count"], a["skill_count"])
+        elif key == "rules" and b.get("files") is not None and a.get("files") is not None and len(b["files"]) != len(a["files"]):
+            extra = "（%d 个文件 → %d 个文件）" % (len(b["files"]), len(a["files"]))
+        L.append("  %s  %s  %s%s%s" % (num(x).rjust(10), num(y).rjust(10), name, extra, "" if x != y else "  没变"))
+    L.append("")
+    L.append("这是各一次新开会话的实测。会话越往后上下文越长，这个数只说明开局。")
+    print("\n".join(L))
+
+
 SELFTEST_FILES = {
     # LF、CRLF 各一份带中文的 settings.json；CRLF 的 config.toml；CRLF 的规则文件；一个 skill 目录
     ".claude/settings.json": '{\n  "env": {\n    "说明": "中文内容 ⚠ → 自检"\n  },\n  "skillOverrides": {\n    "部署": "on"\n  }\n}\n',
@@ -2402,9 +3073,21 @@ def main():
     t = sub.add_parser("set", help="改 JSON / TOML 的一个键")
     t.add_argument("--backup", required=True)
     t.add_argument("--file", required=True)
-    t.add_argument("--path", required=True, help="JSON 数组")
+    t.add_argument("--path", help="JSON 数组")
     t.add_argument("--value", help="JSON 值")
     t.add_argument("--delete", action="store_true")
+    t.add_argument("--many", help="一次改很多个键：一个 JSON 文件，内容是 [{\"path\": [...], \"value\": ...}, ...]")
+    sk = sub.add_parser("skills", help="一次改很多个 skill 的状态（只写 skillOverrides，skill 文件不动）")
+    sk.add_argument("--backup", required=True)
+    sk.add_argument("--state", required=True, help="off 关掉 / manual 只能手动调 / name 只留名字 / on 保留")
+    sk.add_argument("names", nargs="*", help="skill 名字")
+    sk.add_argument("--scan", help="scan --json 写出的文件，配合 --group 用")
+    sk.add_argument("--group", help="整组一起改：A、B、C、D")
+    sk.add_argument("--exclude", nargs="*", help="组里要跳过的 skill")
+    sh = sub.add_parser("show", help="从 scan 的 json 里取一组 skill 的完整名单")
+    sh.add_argument("--scan", required=True)
+    sh.add_argument("--group", required=True)
+    sh.add_argument("--names", action="store_true", help="只打印名字")
     mv = sub.add_parser("move", help="搬文件或目录")
     mv.add_argument("--backup", required=True)
     mv.add_argument("--src", required=True)
@@ -2417,6 +3100,9 @@ def main():
     sub.add_parser("list", help="列出备份")
     stt = sub.add_parser("status", help="对比上次 scan")
     stt.add_argument("--scan", required=True)
+    cp = sub.add_parser("compare", help="两份 scan 的 json 对比开局用量")
+    cp.add_argument("--before", required=True)
+    cp.add_argument("--after", required=True)
     sub.add_parser("selftest", help="在临时目录里自检 backup → set → seal → rollback，不碰真实配置")
     args = ap.parse_args()
     if args.cmd == "selftest":
@@ -2433,7 +3119,8 @@ def main():
         if not selftest(out=sys.stderr):
             die("自检没通过，这台机器上 backup / set / rollback 不安全，已拒绝。只用 scan 看报告，改动请手动做。")
     fn = {"scan": do_scan, "backup": cmd_backup, "set": cmd_set, "move": cmd_move, "seal": cmd_seal,
-          "rollback": cmd_rollback, "list": cmd_list, "status": cmd_status}.get(args.cmd)
+          "rollback": cmd_rollback, "list": cmd_list, "status": cmd_status,
+          "skills": cmd_skills, "show": cmd_show, "compare": cmd_compare}.get(args.cmd)
     if not fn:
         ap.print_help()
         sys.exit(1)
