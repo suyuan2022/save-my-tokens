@@ -10,6 +10,8 @@ disable-model-invocation: true
 
 脚本在本文件旁边：`python3 <本目录>/scripts/slim.py`，下面简写成 `slim`。只用 Python 标准库，参数用 `slim <子命令> -h` 查。
 
+用户的电脑是 Windows 时，先读文末「Windows」一节再往下做。
+
 ## 1. 扫描
 
 ```
@@ -129,13 +131,27 @@ slim set --backup ID --file ~/.codex/config.toml --path '["mcp_servers","playwri
 slim set --backup ID --file ~/.codex/config.toml --path '["skills","config",{"path":"/绝对路径/SKILL.md"},"enabled"]' --value false
 ```
 
-`slim set` 拒绝时会说原因（多行值、内联表、带注释的 JSON）。那种情况只读目标键附近的几行，手动改，改动仍在备份保护内。
+`slim set` 拒绝时会说原因（多行值、内联表、带注释的 JSON、手工排版的 JSON、CRLF 和 LF 混用、文件不是 UTF-8）。这些拒绝是有意的：脚本保证不了目标键以外的字节不变时就不改。那种情况只读目标键附近的几行，手动改，改动仍在备份保护内。
 
 ## 5. 回滚
 
 用户想退回：`slim rollback --backup <ID>`，不给 ID 就退最近一次。有多个备份时从新到旧退。
 
 输出以「停：」开头，说明那些文件在我们改完之后又被动过，此时什么都没还原。规则文件的差异脚本会直接打印出来；把文件名和后来多出的改动告诉用户，由他决定要不要加 `--force`。被替换下来的版本会存在备份目录里，用户想留下的后加内容可以在回滚后补回去。
+
+## Windows
+
+这个脚本没有在真实的 Windows 上跑过。所以在 Windows 上，扫描照常用，改动先过本机自检，过不了就只看报告。
+
+- **怎么调用**：`python3` 在 Windows 上常常是一个跳转到应用商店的空壳。依次试 `python`、`py -3`，用第一个能打印版本号的。
+- **扫描**：`slim scan` 只读，和其他系统一样用。输出是 UTF-8，按 UTF-8 读。
+- **改之前**：`slim backup` 在 Windows 上会先自动自检（约 1 秒，进度打在 stderr）：在系统临时目录里造一份假配置，走一遍备份、改、回滚，核对回滚后每个文件和改前一致。自检没过，`backup` 会拒绝，这台机器上就只用扫描报告，改动告诉用户怎么手动做。想先看一眼可以单独跑 `slim selftest`，它不碰真实配置。
+- **备份只列具体文件**，不列目录。Windows 上 skill 目录里常有软链和目录联接（junction），要备份的路径是这类东西、或者里面有，`backup` 会拒绝。
+- **`slim move` 不可用**，一定会被拒。skill 要下沉到项目，把步骤告诉用户，由他手动搬。
+- **回滚报「被拒绝」**（退出码 5）：文件正被 Claude Code、Codex 或编辑器占用。请用户关掉占用它的程序，再跑一次同样的 `rollback`；这一次如果说文件「又变过」，是上次还原到一半造成的，加 `--force`。
+- **`slim set` 的参数是 JSON**，PowerShell 5.1 会吃掉里面的双引号。在 Git Bash 里跑（Claude Code 在 Windows 上的 Bash 工具就是它）；只能用 PowerShell 时写成 `'[\"skillOverrides\",\"x\"]'`。
+- **配置不在默认位置**：脚本自己认 `CLAUDE_CONFIG_DIR` 和 `CODEX_HOME` 这两个环境变量，不要再传 `--home`，传了会忽略它们。
+- stderr 里「注意：」开头的行（HOME 和 USERPROFILE 不一致、按环境变量换了配置目录、这次不读 `.claude.json`）原样转告用户。
 
 ## 边界
 

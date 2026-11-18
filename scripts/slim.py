@@ -11,6 +11,7 @@
   rollback  还原到备份时的样子，逐项校验 sha256。
   list      列出备份。
   status    对比上次 scan，列出变过但没有备份覆盖的文件。
+  selftest  在系统临时目录里造假 HOME，自检 backup → set → seal → rollback。Windows 上 backup 前会自动跑。
 
 除 scan 外，写入只发生在 HOME 和 backup 时用 --root 声明的目录里。
 """
@@ -56,12 +57,43 @@ def die(msg, code=2):
     sys.exit(code)
 
 
+def is_windows():
+    """真 Windows，或为了在别的系统上测 Windows 分支而设了 SAVE_MY_TOKENS_TREAT_AS_WINDOWS=1。"""
+    return os.name == "nt" or os.environ.get("SAVE_MY_TOKENS_TREAT_AS_WINDOWS") == "1"
+
+
+def utf8_console():
+    """报告里有 ⚠、→ 这类字符；Windows 中文系统默认 GBK，输出编码统一成 UTF-8，写不了的字符替换掉而不是报错。"""
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+# 没显式给 --home 时，由环境变量 CLAUDE_CONFIG_DIR / CODEX_HOME 指定的配置目录；None 表示用默认的 ~/.claude、~/.codex
+CONF = {"claude": None, "codex": None}
+
+
+def claude_dir(home):
+    return CONF["claude"] or os.path.join(home, ".claude")
+
+
+def codex_dir(home):
+    return CONF["codex"] or os.path.join(home, ".codex")
+
+
+def claude_json_path(home):
+    """设了 CLAUDE_CONFIG_DIR 后 .claude.json 在哪，文档快照里查不到，宁可不读。"""
+    return None if CONF["claude"] else os.path.join(home, ".claude.json")
+
+
 # ---------------------------------------------------------------- 基础工具
 
 def expand(p, home):
     if p == "~":
         return home
-    if p.startswith("~/"):
+    if p.startswith("~/") or p.startswith("~" + os.sep):
         return os.path.join(home, p[2:])
     return os.path.abspath(p)
 
@@ -92,7 +124,7 @@ def read_text(p, limit=None):
 
 def load_json_file(p):
     try:
-        with open(p, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8-sig") as f:  # -sig：Windows 记事本存的文件可能带 BOM
             return json.load(f), None
     except FileNotFoundError:
         return None, "absent"
@@ -361,7 +393,7 @@ def iter_jsonl(root, cutoff):
 
 
 def scan_claude_logs(home, cutoff):
-    root = os.path.join(home, ".claude", "projects")
+    root = os.path.join(claude_dir(home), "projects")
     cutoff_iso = iso_utc(cutoff)
     r = {"present": os.path.isdir(root), "files": 0, "bytes": 0, "older_evidence": False, "earliest": "",
          "unreadable": 0, "version": None, "cwds": Counter(), "skill_model": {}, "skill_user": {},
@@ -484,7 +516,7 @@ CODEX_VER_RE = re.compile(rb'"cli_version":\s*"(\d+\.\d+\.\d+)"')
 
 
 def scan_codex_logs(home, cutoff):
-    base = os.path.join(home, ".codex")
+    base = codex_dir(home)
     cutoff_iso = iso_utc(cutoff)
     r = {"present": False, "files": 0, "bytes": 0, "older_evidence": False, "earliest": "", "unreadable": 0,
          "version": None, "cwds": Counter(), "mcp": {}, "skill_reads": {}}
@@ -648,9 +680,9 @@ def imports_of(path, home, depth=0, seen=None):
     return found
 
 
-def rules_in(d):
+def rules_in(d, rd=None):
     out = []
-    rd = os.path.join(d, ".claude", "rules")
+    rd = rd or os.path.join(d, ".claude", "rules")
     if os.path.isdir(rd):
         for dp, _dn, fn in os.walk(rd):
             for f in sorted(fn):
@@ -661,10 +693,10 @@ def rules_in(d):
 
 def claude_global(home):
     files = []
-    g = os.path.join(home, ".claude", "CLAUDE.md")
+    g = os.path.join(claude_dir(home), "CLAUDE.md")
     if os.path.isfile(g):
         files.append(g)
-    files.extend(rules_in(home))
+    files.extend(rules_in(home, os.path.join(claude_dir(home), "rules")))
     for f in list(files):
         files.extend(imports_of(f, home))
     return files
@@ -796,7 +828,7 @@ def do_scan(args, home):
             except OSError:
                 pass
 
-    c_dir, x_dir = os.path.join(home, ".claude"), os.path.join(home, ".codex")
+    c_dir, x_dir = claude_dir(home), codex_dir(home)
     has_claude, has_codex = os.path.isdir(c_dir), os.path.isdir(x_dir)
     cl = scan_claude_logs(home, cutoff) if has_claude else {"present": False, "cwds": Counter(), "files": 0}
     cx = scan_codex_logs(home, cutoff) if has_codex else {"present": False, "cwds": Counter(), "files": 0}
@@ -883,7 +915,8 @@ def do_scan(args, home):
             seen_ps[(s["dir"], h)] = s
             skills.append(s)
     # ~/.claude.json 只读其中三样：skillUsage、mcpServers、projects[*].mcpServers
-    usage_cc, _ = load_json_file(os.path.join(home, ".claude.json")) if has_claude else (None, None)
+    cj = claude_json_path(home)
+    usage_cc, _ = load_json_file(cj) if has_claude and cj else (None, None)
     usage_cc = usage_cc if isinstance(usage_cc, dict) else {}
     skill_usage = {}
     for k, v in (usage_cc.get("skillUsage") or {}).items():
@@ -1588,7 +1621,9 @@ def fingerprint(path):
 
 
 def inside(p, root):
-    return p == root or p.startswith(root + os.sep)
+    # normcase：Windows 上路径不分大小写、/ 和 \ 混用；mac / Linux 上它什么也不做
+    p, root = os.path.normcase(p), os.path.normcase(root)
+    return p == root or p.startswith(root.rstrip(os.sep) + os.sep)
 
 
 def forbidden(path):
@@ -1610,9 +1645,32 @@ def resolve_target(path, roots, home):
     return full
 
 
+def is_reparse(p):
+    """软链，或 Windows 的目录联接等重解析点（Python 3.12 以前 islink 认不出 junction）。"""
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def windows_link_inside(p):
+    """p 本身或它目录里面有没有软链 / 联接。返回第一个找到的，没有返回 None。"""
+    if is_reparse(p):
+        return p
+    if os.path.isdir(p):
+        for dp, dn, fn in os.walk(p):
+            for n in dn + fn:
+                q = os.path.join(dp, n)
+                if is_reparse(q):
+                    return q
+            dn[:] = [d for d in dn if not is_reparse(os.path.join(dp, d))]
+    return None
+
+
 def entry_for(m, path):
     for i, e in enumerate(m["entries"]):
-        if e["path"] == path:
+        if os.path.normcase(e["path"]) == os.path.normcase(path):
             return i, e
     return None, None
 
@@ -1627,11 +1685,18 @@ def require_open(m):
 def cmd_backup(args, home):
     rhome = os.path.realpath(home)
     roots = [rhome] + [os.path.realpath(expand(r, home)) for r in (args.root or [])]
+    roots += [os.path.realpath(d) for d in (CONF["claude"], CONF["codex"]) if d and not any(inside(os.path.realpath(d), r) for r in roots)]
     paths = []
     for p in args.paths:
         full = resolve_target(expand(p, home), roots, home)
         if full not in paths:
             paths.append(full)
+    if is_windows():
+        for p in paths:
+            q = windows_link_inside(p)
+            if q:
+                die("%s 是软链或目录联接（或者里面有）。Windows 上备份、回滚这类东西的行为没有验证过，"
+                    "回滚可能把联接变成一份普通拷贝，已拒绝。只备份里面的普通文件，或手动改。" % show(q, home))
     # 软链指向的真实文件：在允许范围内就一并备份
     extra, notes = [], []
     for p in paths:
@@ -1735,9 +1800,19 @@ def struct_apply(obj, path, value, delete):
         cur[path[-1]] = value
 
 
+def split_newlines(text, kind):
+    """返回 (原文的换行符, 换行统一成 \\n 的文本)。改完再换回去，CRLF 文件不会变成 LF。
+    CRLF 和 LF 混用、或有单独的 \\r 的，判断不了该用哪种，拒绝。"""
+    crlf = text.count("\r\n")
+    if (crlf and crlf != text.count("\n")) or "\r" in text.replace("\r\n", ""):
+        die("这个 %s 文件里 CRLF 和 LF 换行混用，脚本改完没法保证其余字节不变，没有改。请手动改，改动仍在备份保护内。" % kind)
+    return ("\r\n" if crlf else "\n"), (text.replace("\r\n", "\n") if crlf else text)
+
+
 def json_edit(text, path, value, delete):
     if any(isinstance(k, dict) for k in path[-1:]):
         die("--path 的最后一项必须是键名。")
+    nl, text = split_newlines(text, "JSON")
     try:
         obj = json.loads(text) if text.strip() else {}
     except ValueError as e:
@@ -1751,12 +1826,15 @@ def json_edit(text, path, value, delete):
     indent = m.group(1) if m else "  "
     indent = "\t" if indent.startswith("\t") else len(indent)
     ascii_only = bool(text) and all(ord(ch) < 128 for ch in text)
-    new = json.dumps(expected, indent=indent, ensure_ascii=ascii_only)
-    if text.endswith("\n") or not text:
-        new += "\n"
+    tail = "\n" if text.endswith("\n") or not text else ""
+    # 整份重写，只有原文本来就是这个格式时，目标键以外的字节才不会变；不是就不改
+    if text.strip() and json.dumps(obj, indent=indent, ensure_ascii=ascii_only) + tail != text:
+        die("这个 JSON 文件的排版和脚本写出的格式不一样（比如手工排的版），改一个键会连带改动别处，没有改。"
+            "请手动改，改动仍在备份保护内。")
+    new = json.dumps(expected, indent=indent, ensure_ascii=ascii_only) + tail
     if json.loads(new) != expected:
         die("写出的 JSON 校验没过，没有改。")
-    return new, old
+    return new.replace("\n", nl), old
 
 
 def toml_literal(v):
@@ -1786,6 +1864,7 @@ def toml_edit(text, path, value, delete):
     table = path[:sel_at[0]] if sel_at else path[:-1]
     sel = path[sel_at[0]] if sel_at else None
     key = path[-1]
+    nl, text = split_newlines(text, "TOML")
     try:
         old_obj = tomllib.loads(text)
     except Exception as e:
@@ -1830,7 +1909,7 @@ def toml_edit(text, path, value, delete):
     newline = "%s = %s" % (toml_key(key), None if delete else toml_literal(value))
     if seg is None:
         if delete:
-            return text, old
+            return text.replace("\n", nl), old
         head = ".".join(toml_key(p) for p in table)
         block = ["[[%s]]" % head if sel is not None else "[%s]" % head]
         for a, b in (sel or {}).items():
@@ -1850,7 +1929,7 @@ def toml_edit(text, path, value, delete):
                 die("%s 现在的值跨多行，脚本不改这种，请手动改。" % key)
         if delete:
             if hit is None:
-                return text, old
+                return text.replace("\n", nl), old
             del lines[hit]
         elif hit is not None:
             lines[hit] = re.match(r"^\s*", lines[hit]).group(0) + newline
@@ -1869,7 +1948,7 @@ def toml_edit(text, path, value, delete):
         die("改完的 TOML 解析不了（%s），文件没动。请手动改。" % e)
     if got != expected:
         die("改完的 TOML 和预期不一致，文件没动。请手动改。")
-    return new, old
+    return new.replace("\n", nl), old
 
 
 def track_makedirs(m, d):
@@ -1883,11 +1962,22 @@ def track_makedirs(m, d):
 
 
 def atomic_write(path, text, mode):
+    # 先写临时文件再整体替换：任何一步失败，原文件都还是原样，临时文件删掉，不留半截
     tmp = path + ".save-my-tokens-tmp"
-    with open(tmp, "w", encoding="utf-8", newline="") as f:
-        f.write(text)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        if isinstance(e, PermissionError):
+            die("写 %s 被拒绝（%s）。Windows 上多半是文件正被别的程序占用（Claude Code、Codex、编辑器、杀毒软件），"
+                "或者文件是只读的。原文件没动。关掉占用它的程序后再试。" % (path, e))
+        die("写 %s 失败（%s），原文件没动。" % (path, e))
 
 
 def redacted(path, v):
@@ -1926,14 +2016,21 @@ def cmd_set(args, home):
     exists = os.path.isfile(full)
     text = ""
     if exists:
-        with open(full, "r", encoding="utf-8", newline="") as f:
-            text = f.read()
+        try:
+            # newline=""：原样读进 CRLF，改完原样写回
+            with open(full, "r", encoding="utf-8", newline="") as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            die("%s 不是 UTF-8 编码（可能是 GBK），脚本不改，请手动改。" % show(full, home))
+    bom = chr(0xFEFF) if text.startswith(chr(0xFEFF)) else ""   # Windows 记事本可能加 BOM，原样保留
+    body = text[len(bom):]
     if full.endswith(".toml"):
-        new, old = toml_edit(text, path, value, args.delete)
+        new, old = toml_edit(body, path, value, args.delete)
     elif full.endswith(".json"):
-        new, old = json_edit(text, path, value, args.delete)
+        new, old = json_edit(body, path, value, args.delete)
     else:
         die("set 只改 .json 和 .toml。别的文件请直接编辑，改动仍在备份保护内。")
+    new = bom + new
     label = ".".join(k if isinstance(k, str) else json.dumps(k, ensure_ascii=False) for k in path)
     if new == text:
         print("没有变化：%s 里 %s 已经是这个值。" % (show(full, home), label))
@@ -2008,6 +2105,21 @@ def set_aside(path, aside_dir, idx):
     shutil.move(path, os.path.join(dst, os.path.basename(path)))
 
 
+def restore_one(p, pre, src, aside, i):
+    set_aside(p, aside, i)
+    if pre["kind"] == "file":
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        shutil.copy2(os.path.join(src, "blob"), p)
+        os.chmod(p, pre["mode"])
+    elif pre["kind"] == "dir":
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        shutil.copytree(os.path.join(src, "tree"), p, symlinks=True)
+        os.chmod(p, pre["mode"])
+    elif pre["kind"] == "symlink":
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        os.symlink(pre["target"], p)
+
+
 def cmd_rollback(args, home):
     manifests = all_manifests(home)
     if args.backup:
@@ -2055,19 +2167,13 @@ def cmd_rollback(args, home):
         p, pre = e["path"], e["pre"]
         if fingerprint(p) == pre:
             continue
-        set_aside(p, aside, i)
-        src = os.path.join(bdir, "pre", str(i))
-        if pre["kind"] == "file":
-            os.makedirs(os.path.dirname(p), exist_ok=True)
-            shutil.copy2(os.path.join(src, "blob"), p)
-            os.chmod(p, pre["mode"])
-        elif pre["kind"] == "dir":
-            os.makedirs(os.path.dirname(p), exist_ok=True)
-            shutil.copytree(os.path.join(src, "tree"), p, symlinks=True)
-            os.chmod(p, pre["mode"])
-        elif pre["kind"] == "symlink":
-            os.makedirs(os.path.dirname(p), exist_ok=True)
-            os.symlink(pre["target"], p)
+        try:
+            restore_one(p, pre, os.path.join(bdir, "pre", str(i)), aside, i)
+        except PermissionError as err:
+            die("还原 %s 时被拒绝（%s）。Windows 上多半是文件正被别的程序占用（Claude Code、Codex、编辑器）。"
+                "已经还原到一半，被替换下来的版本在 %s，不会丢。关掉占用它的程序后再跑一次同样的 rollback 接着还原；"
+                "如果它说文件「又变过」，那是这次还原到一半造成的，加 --force。"
+                % (show(p, home), err, show(aside, home)), 5)
         restored += 1
     for d in sorted(m.get("created_dirs", []), key=len, reverse=True):
         try:
@@ -2129,7 +2235,155 @@ def cmd_status(args, home):
         print("自上次扫描以来，扫描过的配置和规则文件都没变。")
 
 
+SELFTEST_FILES = {
+    # LF、CRLF 各一份带中文的 settings.json；CRLF 的 config.toml；CRLF 的规则文件；一个 skill 目录
+    ".claude/settings.json": '{\n  "env": {\n    "说明": "中文内容 ⚠ → 自检"\n  },\n  "skillOverrides": {\n    "部署": "on"\n  }\n}\n',
+    ".claude/settings.local.json": '{\r\n  "env": {\r\n    "说明": "中文内容，CRLF 换行"\r\n  },\r\n  "skillOverrides": {\r\n    "部署": "on"\r\n  }\r\n}\r\n',
+    ".codex/config.toml": '# 中文注释\r\nmodel = "gpt"\r\n\r\n[mcp_servers.demo]\r\ncommand = "npx"\r\nnote = "演示"\r\nenabled = true\r\n',
+    ".claude/CLAUDE.md": "# 规则\r\n\r\n- 用中文回答\r\n",
+    ".claude/skills/演示/SKILL.md": "---\nname: 演示\ndescription: 自检用\n---\n正文\n",
+}
+
+
+def selftest(out=None):
+    """在系统临时目录里造一个假 HOME，用本脚本自己的 backup → set → seal → rollback 走一遍，
+    校验回滚后每个文件的 sha256 和改前一样。逐步打印，返回是否全部通过。不碰真实 HOME。"""
+    import contextlib
+    import io
+    import tempfile
+    out = out or sys.stdout
+    saved = dict(CONF)
+    CONF.update(claude=None, codex=None)
+    results = []
+
+    def step(name, ok, detail=""):
+        results.append(bool(ok))
+        print("  %s  %s%s" % ("通过" if ok else "失败", name, "：" + detail if detail and not ok else ""), file=out)
+        return ok
+
+    def call(fn, home, **kw):
+        o, e = io.StringIO(), io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+            try:
+                fn(argparse.Namespace(**kw), home)
+            except SystemExit as x:
+                code = x.code if isinstance(x.code, int) else 1
+        return code, (o.getvalue() + e.getvalue()).strip()
+
+    def raw(p):
+        with open(p, "rb") as f:
+            return f.read().decode("utf-8")
+
+    def one_line_changed(a, b, nl):
+        la, lb = a.split(nl), b.split(nl)
+        if nl == "\r\n" and any("\n" in x or "\r" in x for x in lb):
+            return False
+        if nl == "\n" and "\r" in b:
+            return False
+        return len(la) == len(lb) and sum(x != y for x, y in zip(la, lb)) == 1
+
+    print("自检：在临时目录里造假 HOME，走一遍 backup → set → seal → rollback（Python %s，%s）" % (
+        sys.version.split()[0], "Windows" if is_windows() else os.name), file=out)
+    try:
+        tmp = tempfile.mkdtemp(prefix="save-my-tokens-selftest-")
+    except OSError as e:
+        CONF.update(saved)
+        step("在系统临时目录里建目录", False, str(e))
+        print("自检没通过。", file=out)
+        return False
+    try:
+        home = os.path.join(tmp, "home")
+        for rel, text in SELFTEST_FILES.items():
+            p = os.path.join(home, *rel.split("/"))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(text.encode("utf-8"))
+        home = os.path.realpath(home)
+        P = lambda rel: os.path.join(home, *rel.split("/"))
+        before = {rel: sha256_file(P(rel)) for rel in SELFTEST_FILES}
+        skill_dir = P(".claude/skills/演示")
+        skill_fp = fingerprint(skill_dir)
+        targets = [P(".claude/settings.json"), P(".claude/settings.local.json"), P(".codex/config.toml"),
+                   P(".claude/CLAUDE.md"), skill_dir]
+        code, msg = call(cmd_backup, home, paths=targets, root=None, note="selftest")
+        ms = all_manifests(home)
+        if not step("backup 建好备份", code == 0 and len(ms) == 1, msg):
+            return False
+        bid = ms[0]["id"]
+        for rel, nl in ((".claude/settings.json", "\n"), (".claude/settings.local.json", "\r\n")):
+            pre = raw(P(rel))
+            code, msg = call(cmd_set, home, backup=bid, file=P(rel), path='["skillOverrides","部署"]', value='"off"', delete=False)
+            post = raw(P(rel)) if code == 0 else pre
+            ok = code == 0 and json.loads(post)["skillOverrides"]["部署"] == "off" and one_line_changed(pre, post, nl)
+            step("set 改 %s（%s 换行）：只变目标键那一行，换行风格不变" % (rel, "CRLF" if nl == "\r\n" else "LF"), ok, msg or "其余字节变了")
+        if tomllib:
+            rel = ".codex/config.toml"
+            pre = raw(P(rel))
+            code, msg = call(cmd_set, home, backup=bid, file=P(rel), path='["mcp_servers","demo","enabled"]', value="false", delete=False)
+            post = raw(P(rel)) if code == 0 else pre
+            ok = code == 0 and tomllib.loads(post)["mcp_servers"]["demo"]["enabled"] is False and one_line_changed(pre, post, "\r\n")
+            step("set 改 %s（CRLF 换行）：只变目标键那一行，换行风格不变" % rel, ok, msg or "其余字节变了")
+        else:
+            print("  跳过  set 改 config.toml：这个 Python 没有 tomllib，TOML 修改本来就会拒绝", file=out)
+        with open(P(".claude/CLAUDE.md"), "ab") as f:
+            f.write("- 自检加的一行\r\n".encode("utf-8"))
+        with open(os.path.join(skill_dir, "SKILL.md"), "ab") as f:
+            f.write("自检加的一行\n".encode("utf-8"))
+        code, msg = call(cmd_seal, home, backup=bid)
+        step("seal 封存", code == 0, msg)
+        changed = [rel for rel in SELFTEST_FILES if sha256_file(P(rel)) != before[rel]]
+        step("改动确实落到了文件上", len(changed) == len(SELFTEST_FILES) - (0 if tomllib else 1), "只变了 %s" % changed)
+        code, msg = call(cmd_rollback, home, backup=bid, force=False)
+        step("rollback 回滚", code == 0, msg)
+        bad = [rel for rel in SELFTEST_FILES if not os.path.isfile(P(rel)) or sha256_file(P(rel)) != before[rel]]
+        step("回滚后每个文件的 sha256 和改前一致", not bad, "不一致：%s" % bad)
+        step("回滚后 skill 目录和改前一致", fingerprint(skill_dir) == skill_fp)
+        left = [os.path.join(dp, f) for dp, _d, fn in os.walk(home) for f in fn if f.endswith(".save-my-tokens-tmp")]
+        step("没有留下半截的临时文件", not left, "%s" % left)
+    except Exception as e:  # 自检本身出意外也算没通过，不往外抛
+        step("自检过程", False, "%s: %s" % (type(e).__name__, e))
+    finally:
+        CONF.update(saved)
+        shutil.rmtree(tmp, ignore_errors=True)
+        step("清理临时目录", not os.path.exists(tmp), tmp)
+    ok = bool(results) and all(results)
+    print("自检%s。" % ("全部通过" if ok else "没通过"), file=out)
+    return ok
+
+
+def resolve_home(args):
+    """返回 HOME。没显式给 --home 时，按 CLAUDE_CONFIG_DIR / CODEX_HOME 定配置目录。"""
+    if args.home:
+        return args.home
+    home = os.environ.get("HOME")
+    if is_windows():
+        # 官方文档：Windows 上 ~/.claude 指 %USERPROFILE%\.claude
+        up = os.environ.get("USERPROFILE")
+        if up:
+            if home and os.path.normcase(os.path.abspath(home)) != os.path.normcase(os.path.abspath(up)):
+                print("注意：HOME（%s）和 USERPROFILE（%s）不一样，按 USERPROFILE 算；不对就用 --home 指定。" % (home, up), file=sys.stderr)
+            home = up
+    for key, var in (("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME")):
+        v = os.environ.get(var)
+        if not v:
+            continue
+        if not os.path.isabs(v):
+            die("环境变量 %s=%r 不是绝对路径，判断不了它实际指哪个目录。改成绝对路径，或用 --home 指定。" % (var, v))
+        CONF[key] = os.path.abspath(v)
+        print("注意：按环境变量 %s 读写配置目录 %s。" % (var, CONF[key]), file=sys.stderr)
+    if CONF["claude"]:
+        print("注意：设了 CLAUDE_CONFIG_DIR 后 .claude.json 放在哪，官方文档没写清，这次不读它（skillUsage 和用户级 MCP 不核对）。", file=sys.stderr)
+    elif home:
+        s, _ = load_json_file(os.path.join(home, ".claude", "settings.json"))
+        if isinstance(s, dict) and isinstance(s.get("env"), dict) and s["env"].get("CLAUDE_CONFIG_DIR"):
+            print("注意：~/.claude/settings.json 的 env 里设了 CLAUDE_CONFIG_DIR，但当前环境变量里没有；"
+                  "Claude Code 实际用的配置目录可能不是 ~/.claude，这次仍按 ~/.claude 算。", file=sys.stderr)
+    return home
+
+
 def main():
+    utf8_console()
     ap = argparse.ArgumentParser(prog="slim.py", description="coding agent 配置体检：取证、备份、回滚。")
     ap.add_argument("--home", help="把哪个目录当 HOME（默认用环境变量 HOME）")
     sub = ap.add_subparsers(dest="cmd")
@@ -2163,11 +2417,21 @@ def main():
     sub.add_parser("list", help="列出备份")
     stt = sub.add_parser("status", help="对比上次 scan")
     stt.add_argument("--scan", required=True)
+    sub.add_parser("selftest", help="在临时目录里自检 backup → set → seal → rollback，不碰真实配置")
     args = ap.parse_args()
-    home = args.home or os.environ.get("HOME")
+    if args.cmd == "selftest":
+        sys.exit(0 if selftest() else 1)
+    if is_windows() and args.cmd == "move":
+        die("Windows 上不支持 move：目录联接（junction）和软链在 Windows 上搬动、回滚的行为没有验证过，"
+            "可能搬走或还原错东西。需要搬的请手动操作，或只用 scan 看报告。")
+    home = resolve_home(args)
     if not home or not os.path.isdir(home):
         die("HOME 无效：%r" % home)
     home = os.path.abspath(home)
+    if is_windows() and args.cmd == "backup":
+        print("Windows：备份前先在这台机器上自检一遍。", file=sys.stderr)
+        if not selftest(out=sys.stderr):
+            die("自检没通过，这台机器上 backup / set / rollback 不安全，已拒绝。只用 scan 看报告，改动请手动做。")
     fn = {"scan": do_scan, "backup": cmd_backup, "set": cmd_set, "move": cmd_move, "seal": cmd_seal,
           "rollback": cmd_rollback, "list": cmd_list, "status": cmd_status}.get(args.cmd)
     if not fn:

@@ -61,9 +61,21 @@ python3 ~/.claude/skills/save-my-tokens/scripts/slim.py rollback
 - 用脚本改 TOML（Codex 的 `config.toml`）需要 Python 3.11 以上。
 - 读 Codex 压缩的旧日志（`.jsonl.zst`）需要 Python 3.14 以上，或系统里有 `zstd` 命令；都没有时报告会写明有多少个文件没读到。
 
+## Windows
+
+这个脚本还没有在真实的 Windows 上跑过，所以做成了「拿不准就不改」：
+
+- 扫描只读，照常用。命令里的 `python3` 换成 `python` 或 `py -3`，路径换成 `%USERPROFILE%\.claude\skills\save-my-tokens`。
+- 每次备份前，脚本先在系统临时目录里造一份假配置，走一遍备份、改、回滚，核对回滚后每个文件和改前一致。没过就拒绝改动，只给报告。想自己先看一眼：`python scripts\slim.py selftest`，它不碰你的真实配置。
+- 搬目录（`move`）在 Windows 上关闭。要备份的路径是软链或目录联接时也会拒绝。
+- 带 BOM、CRLF 换行的配置文件，改完保持原样；换行混用、不是 UTF-8 的文件不改。
+- 配置目录用 `CLAUDE_CONFIG_DIR`、`CODEX_HOME` 改过位置的，脚本会跟着读。
+
+在 Windows 上跑出问题，欢迎提 issue，带上 `selftest` 的输出。
+
 ## 已知的限制
 
-- 只在 macOS 上跑过。
+- 只在 macOS 上跑过；Windows 的情况见上一节。
 - Codex 的 skill 使用次数是从「工具调用里读了某个 SKILL.md」推断的，不是官方计数。
 - 意思相同、措辞不同的重复规则，脚本找不到，靠 agent 读文件判断。
 - 开关清单只收了对着官方文档核过的二十几个键，键名和默认值会随版本变，每条都带出处和核对日期。
