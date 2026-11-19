@@ -1581,7 +1581,7 @@ def render(ev, home, show_all):
     if c["present"]:
         render_startup(L, c, home, days)
         L.append("")
-        L.append("######## 二、清理：每次请求都带着、可以拿掉的东西 ########")
+        L.append("######## 清理：每次请求都带着、可以拿掉的东西 ########")
 
         sk = c["skills"]
         usr = [s for s in sk if s["scope"] == "user"]
@@ -1819,7 +1819,7 @@ def render(ev, home, show_all):
         L.append("（有 %d 组项目目录的规则文件内容完全相同，多半是同一个仓库的 worktree，共 %d 个目录，每组只算一次。）" % (len(grouped), sum(len(p["same_as"]) + 1 for p in grouped)))
 
     L.append("")
-    L.append("######## 三、配置：不删东西，只改几个设置 ########")
+    L.append("######## 配置：不删东西，只改几个设置 ########")
     if c["present"]:
         render_config(L, c, days)
     L.append("")
@@ -1920,7 +1920,7 @@ PART_CAN = {
 def render_startup(L, c, home, days):
     st = c.get("startup")
     L.append("")
-    L.append("######## 一、开局：新开一个会话，第一句话还没答，已经带了多少 ########")
+    L.append("######## 开局：新会话的第一次请求带了多少 token ########")
     if not st:
         L.append("日志里没找到新开会话的记录（Claude Code 版本太旧，或窗口内没有新会话），这一块量不出来。")
         L.append("替代办法：让用户新开一个会话，什么都不说，直接输入 /context，把结果贴过来。")
