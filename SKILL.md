@@ -135,7 +135,21 @@ slim scan --json <系统临时目录>/save-my-tokens-scan.json
 - 摆报告里的数：每一档上下文长度以上发出去了多少请求、多少 token，有多少个会话长到过那么大。
 - 从报告的档位里挑两三个，加上「不改」，每个说清对应哪一行数字，让他选。
 - 改法：`settings.json` 的 `autoCompactWindow`，取值 100000 到 1000000。报告写着环境变量 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 已经设了的，改环境变量那一项（`["env","CLAUDE_CODE_AUTO_COMPACT_WINDOW"]`），因为它优先。
-- 可选的一句规则。压缩之后模型手里只有摘要，容易当成全部。用户愿意的话，在全局规则文件里加一句（给他看 diff）：「上下文被压缩之后，你手里的是摘要。继续干活前，缺的细节回会话日志或任务记录里找。」
+- 窗口改不改，接着问下一项：压缩后提醒。
+
+### 压缩后提醒（hook）
+
+先跑 `slim hook status`（只读）：它说装没装、有没有别的压缩后 hook，并打印提醒原文。然后跟用户讲三件事，再问装不装：
+
+1. **它补的是什么**：压缩之后模型手里只有一份摘要，摘要漏了什么它自己察觉不到。最容易丢的是较早提过、还没做完的事；命令、路径、数字、用户原话也可能不准。
+2. **hook 是什么**：写在 `settings.json` 里、由 Claude Code 在固定时刻自动跑的一小段命令，模型不用记得去做。这一个只在每次压缩完成那一刻跑一次，把提醒原文放进模型的上下文：回压缩前的完整记录（Claude Code 本来就存在本机的会话日志）核对细节，把用户提过的事从头过一遍、逐条确认做完没有。装的时候做两件事：往 `settings.json` 的 `hooks.SessionStart` 加一条，把脚本拷进 `~/.claude/hooks/`；卸掉时两样都拿走。每次运行它只打印这段话，不联网，不写文件，不留后台进程。把 status 打印的原文给用户看。
+3. **代价和效果**：每次压缩后多带这段约 370 字的提醒，外加一个日志路径。钱主要花在模型照着去翻日志：实测压缩后的第一个回答平均多花约四分之一。用户问效果、问值不值，读 `references/compact-hook.md`，照那里的实测说，说清测的是哪一版、样本多大。
+
+用户已经有别的压缩后 hook 时，两段提醒会一起出现。读 status 列出的那条命令指向的脚本，把两段提醒并排给用户看，问他留哪个，或者两个都留。要去掉他自己的那条：用 `python3 -c` 只打印 `settings.json` 的 `hooks.SessionStart`，去掉那一项，再用 `slim set --path '["hooks","SessionStart"]' --value <剩下的整个数组>` 写回；他的脚本文件留在原处。
+
+用户说不装，这一项就不进改动清单。以后要卸：新开一个备份（列 status 里那两个路径），`slim hook remove --backup <新 ID>`，再 `seal`。`rollback` 会把同一次备份里的其他改动一起退回，只卸提醒时用 `remove`。
+
+只有 Claude Code 有这个时机；Codex 这里不装。
 
 ### 缓存：放着不动再回来
 
@@ -168,6 +182,7 @@ slim scan --json <系统临时目录>/save-my-tokens-scan.json
    - skill 的状态用 `slim skills`，一次改一整组或点名的一批。
    - `settings.json`、`config.toml` 里的其他键用 `slim set`，多个键写进一个文件用 `--many` 一次改完。这两个文件里常有凭据，全程通过脚本操作，不打开全文。
    - 搬目录用 `slim move --backup <ID> --src <原路径> --dst <搬过去之后的完整路径>`。`--dst` 写到最后那一级名字（`<项目>/.claude/skills/<skill 名>`），两个路径都要在第 1 步的备份里。
+   - 压缩后提醒用 `slim hook install --backup <ID>`，卸掉用 `remove`。备份时列 `slim hook status` 里「装或卸之前先备份这两个路径」那一行的两个路径。
    - Markdown 规则文件直接编辑。
 3. **封存**：`slim seal --backup <ID>`。
 4. **核对**：`slim status --scan <第 1 步的 json>`。
@@ -184,6 +199,7 @@ slim set --backup ID --file ~/.claude/settings.json --path '["skillOverrides","c
 slim set --backup ID --file ~/.claude/settings.json --many <文件>
 slim set --backup ID --file ~/.codex/config.toml --path '["mcp_servers","playwright","enabled"]' --value false
 slim set --backup ID --file ~/.codex/config.toml --path '["skills","config",{"path":"/绝对路径/SKILL.md"},"enabled"]' --value false
+slim hook install --backup ID
 ```
 
 `--state` 取 `off`（关掉）、`manual`（只能手动调）、`name`（只留名字）、`on`（保留）。`--path` 是 JSON 数组，`--value` 是 JSON 值。`--many` 的文件是一个 JSON 数组，每项 `{"path": [...], "value": ...}` 或 `{"path": [...], "delete": true}`，有一项被拒就整批不改。

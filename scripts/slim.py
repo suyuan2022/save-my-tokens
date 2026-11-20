@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import sys
@@ -2686,6 +2687,160 @@ def cmd_move(args, home):
     print("已搬 %s → %s" % (show(src, home), show(dst, home)))
 
 
+# ------------------------------------------------------------------ 压缩后提醒 hook
+
+HOOK_NAME = "save-my-tokens-compact.py"
+HOOK_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "compact-reminder.py")
+
+
+def hook_paths(home):
+    cd = claude_dir(home)
+    return os.path.join(cd, "settings.json"), os.path.join(cd, "hooks", HOOK_NAME)
+
+
+def hook_command(target):
+    if is_windows():
+        return '"%s" "%s"' % (sys.executable or "python", target)
+    return "python3 " + shlex.quote(target)
+
+
+def read_settings(path):
+    """返回 (bom, 正文, 解析后的对象)。文件不存在时是空对象。"""
+    if not os.path.isfile(path):
+        return "", "", {}
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+    except UnicodeDecodeError:
+        die("%s 不是 UTF-8 编码，脚本不改，请手动改。" % path)
+    bom = chr(0xFEFF) if text.startswith(chr(0xFEFF)) else ""
+    body = text[len(bom):]
+    try:
+        obj = json.loads(body) if body.strip() else {}
+    except ValueError as e:
+        die("%s 解析不了（%s），没有改。可能带注释，请手动改。" % (path, e))
+    if not isinstance(obj, dict):
+        die("%s 顶层不是对象，没有改。" % path)
+    return bom, body, obj
+
+
+def session_start_groups(obj):
+    hooks = obj.get("hooks", {})
+    if not isinstance(hooks, dict):
+        die("settings.json 里的 hooks 不是对象，没有改。请手动看一下。")
+    groups = hooks.get("SessionStart", [])
+    if not isinstance(groups, list):
+        die("settings.json 里的 hooks.SessionStart 不是数组，没有改。请手动看一下。")
+    return hooks, groups
+
+
+def is_ours(h):
+    return isinstance(h, dict) and HOOK_NAME in str(h.get("command", ""))
+
+
+def hook_report(home):
+    settings, target = hook_paths(home)
+    _bom, _body, obj = read_settings(settings)
+    _hooks, groups = session_start_groups(obj)
+    ours = any(is_ours(h) for g in groups if isinstance(g, dict) for h in g.get("hooks") or [])
+    others = []
+    for g in groups:
+        if isinstance(g, dict) and "compact" in str(g.get("matcher", "")):
+            others += [str(h.get("command", "")) for h in g.get("hooks") or [] if isinstance(h, dict) and not is_ours(h)]
+    with open(HOOK_SRC, encoding="utf-8") as f:
+        shipped = f.read()
+    installed = None
+    if os.path.isfile(target):
+        with open(target, encoding="utf-8", errors="replace") as f:
+            installed = f.read()
+    return {"settings": settings, "target": target, "registered": ours, "file": installed is not None,
+            "current": installed == shipped, "others": others, "shipped": shipped,
+            "disabled": obj.get("disableAllHooks") is True}
+
+
+def cmd_hook(args, home):
+    r = hook_report(home)
+    settings, target = r["settings"], r["target"]
+    if args.action == "status":
+        if r["registered"] and r["file"]:
+            print("压缩后提醒：已装上%s。" % ("，和这个 skill 带的版本一致" if r["current"] else "，但文件和这个 skill 带的版本不一样（重新 install 会换成新版）"))
+        elif r["registered"] or r["file"]:
+            print("压缩后提醒：只装了一半（%s）。重新 install 或 remove 都能收拾干净。"
+                  % ("settings.json 里登记了，文件不在" if r["registered"] else "文件在，settings.json 里没登记"))
+        else:
+            print("压缩后提醒：没装。")
+        for c in r["others"]:
+            print("已有别的压缩后 hook：%s" % clip(c, 120))
+        if r["disabled"]:
+            print("注意：settings.json 里 disableAllHooks 是 true，所有 hook 现在都不跑。")
+        print("装或卸之前先备份这两个路径：%s %s" % (show(settings, home), show(target, home)))
+        print("\n提醒原文（每次压缩后放进模型上下文，{路径} 换成压缩前完整记录的位置）：")
+        body = r["shipped"].split('print(f"""', 1)[-1].rsplit('""")', 1)[0]
+        print(body.replace("{p}", "{路径}"))
+        return
+    if not args.backup:
+        die("install 和 remove 要给 --backup。先 backup --paths %s %s" % (show(settings, home), show(target, home)))
+    m = load_manifest(home, args.backup)
+    require_open(m)
+    for p in (settings, target):
+        full = resolve_target(p, m["roots"], home)
+        if entry_for(m, full)[1] is None:
+            die("%s 不在备份 %s 里。先 backup --paths %s %s" % (show(full, home), m["id"], show(settings, home), show(target, home)))
+    _bom, body, obj = read_settings(settings)
+    hooks, groups = session_start_groups(obj)
+    if args.action == "install":
+        new = copy.deepcopy(groups)
+        if not r["registered"]:
+            new.append({"matcher": "compact", "hooks": [{"type": "command", "command": hook_command(target), "timeout": 5}]})
+        edits = [(["hooks", "SessionStart"], new, False)] if new != groups else []
+    else:
+        new = []
+        for g in groups:
+            if isinstance(g, dict) and isinstance(g.get("hooks"), list) and any(is_ours(h) for h in g["hooks"]):
+                g = dict(g, hooks=[h for h in g["hooks"] if not is_ours(h)])
+                if not g["hooks"]:
+                    continue
+            new.append(g)
+        if new == groups:
+            edits = []
+        elif new:
+            edits = [(["hooks", "SessionStart"], new, False)]
+        elif set(hooks) == {"SessionStart"}:
+            edits = [(["hooks"], None, True)]
+        else:
+            edits = [(["hooks", "SessionStart"], None, True)]
+    tmp = body
+    for path, value, delete in edits:   # 先在内存里试改一遍：排版对不上会在这里停下，文件一个都没动
+        tmp, _old = json_edit(tmp, path, value, delete)
+    if args.action == "install":
+        if not r["current"]:
+            track_makedirs(m, os.path.dirname(target))
+            atomic_write(target, r["shipped"], 0o755)
+            m["ops"].append({"op": "write", "file": target})
+            save_manifest(home, m)
+            print("已写 %s" % show(target, home))
+        if edits:
+            apply_edits(home, m["id"], settings, edits, summary="hooks.SessionStart 加了一条 compact")
+        if r["current"] and not edits:
+            print("已经装好，没有变化。")
+        for c in r["others"]:
+            print("注意：已有别的压缩后 hook，两段提醒会一起出现：%s" % clip(c, 120))
+        if r["disabled"]:
+            print("注意：settings.json 里 disableAllHooks 是 true，装上了也不会跑。")
+    else:
+        if edits:
+            apply_edits(home, m["id"], settings, edits, summary="hooks.SessionStart 去掉压缩后提醒")
+        if os.path.isfile(target):
+            os.remove(target)
+            m = load_manifest(home, m["id"])
+            m["ops"].append({"op": "remove", "file": target})
+            save_manifest(home, m)
+            print("已移走 %s（备份里有原样拷贝）" % show(target, home))
+        if not edits and not r["file"]:
+            print("本来就没装，没有变化。")
+    print("新开的会话里生效。改完记得 seal。")
+
+
 def describe(pre, cur):
     if pre == cur:
         return "没变"
@@ -2829,6 +2984,8 @@ def cmd_list(args, home):
         for op in m.get("ops", []):
             if op["op"] == "set":
                 print("    · set %s %s：%s → %s" % (show(op["file"], home), json.dumps(op["path"], ensure_ascii=False), op["old"], op["new"]))
+            elif op["op"] in ("write", "remove"):
+                print("    · %s %s" % ({"write": "写入", "remove": "移走"}[op["op"]], show(op["file"], home)))
             else:
                 print("    · move %s → %s" % (show(op["src"], home), show(op["dst"], home)))
 
@@ -3103,6 +3260,9 @@ def main():
     cp = sub.add_parser("compare", help="两份 scan 的 json 对比开局用量")
     cp.add_argument("--before", required=True)
     cp.add_argument("--after", required=True)
+    hk = sub.add_parser("hook", help="压缩后提醒 hook：status 查看 / install 装上 / remove 卸掉")
+    hk.add_argument("action", choices=["status", "install", "remove"])
+    hk.add_argument("--backup", help="install 和 remove 要给")
     sub.add_parser("selftest", help="在临时目录里自检 backup → set → seal → rollback，不碰真实配置")
     args = ap.parse_args()
     if args.cmd == "selftest":
@@ -3120,7 +3280,7 @@ def main():
             die("自检没通过，这台机器上 backup / set / rollback 不安全，已拒绝。只用 scan 看报告，改动请手动做。")
     fn = {"scan": do_scan, "backup": cmd_backup, "set": cmd_set, "move": cmd_move, "seal": cmd_seal,
           "rollback": cmd_rollback, "list": cmd_list, "status": cmd_status,
-          "skills": cmd_skills, "show": cmd_show, "compare": cmd_compare}.get(args.cmd)
+          "skills": cmd_skills, "show": cmd_show, "compare": cmd_compare, "hook": cmd_hook}.get(args.cmd)
     if not fn:
         ap.print_help()
         sys.exit(1)

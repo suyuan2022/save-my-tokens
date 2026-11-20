@@ -22,7 +22,7 @@ python3 ~/.claude/skills/save-my-tokens/scripts/slim.py scan
 python3 ~/.claude/skills/save-my-tokens/scripts/slim.py rollback
 ```
 
-卸载直接删 `~/.claude/skills/save-my-tokens`。
+卸载直接删 `~/.claude/skills/save-my-tokens`。装过压缩后提醒的，先照下面「压缩后提醒」一节把它卸掉：它装在 skill 目录外面，删 skill 不会带走它。
 
 ## 怎么工作
 
@@ -44,12 +44,53 @@ python3 ~/.claude/skills/save-my-tokens/scripts/slim.py rollback
 
 在构造配置（318 个 skill、大规则文件）上，用真实 Claude Code 2.1.321 测过：第一次请求 85,854 → 清理后 20,383 → 回滚后 85,854 token。这是构造配置的结果，不代表实际能省多少。
 
+## 压缩后提醒（可选）
+
+对话太长时，Claude Code 会把前面的内容压成一份摘要再接着聊，这叫压缩。之后模型手里只有摘要，摘要漏了什么它察觉不到：较早提过、还没做完的事最容易丢，命令、路径、数字也可能不准。
+
+skill 走到配置那一步，会问你要不要装一个 hook 来补这一块。hook 是写在 `~/.claude/settings.json` 里、由 Claude Code 在固定时刻自动跑的命令。这一个只在每次压缩完成时跑一次，把一段约 370 字的提醒放进模型的上下文：回压缩前的完整记录核对细节，把你提过的要求从头过一遍，逐条确认做完没有。完整记录就是 Claude Code 本来就存在本机的会话日志（`~/.claude/projects/` 下的 `.jsonl`），hook 只告诉模型它在哪。提醒原文在 `hooks/compact-reminder.py`。
+
+装的时候做两件事：往 `settings.json` 的 `hooks.SessionStart` 加一条，把脚本拷到 `~/.claude/hooks/save-my-tokens-compact.py`；卸掉时两样都拿走。每次运行它只打印那段提醒，不联网，不写文件，不留后台进程。
+
+代价：压缩后的第一个回答平均多花约四分之一（实测 $0.39 → $0.49），钱主要花在模型回去翻日志，提醒本身只有几百个 token。
+
+实测：取一位用户真实会话里的 10 次压缩，恢复到压缩刚完成的那一刻，分别在装与不装的情况下接着跑（Claude Opus 5.5，另一个模型盲评 0–10 分）。
+
+| | 不装 | 装 |
+|---|---|---|
+| 拿用户压缩后真实说的下一句去问，回答的均分（满分 10） | 3.30 | 4.55 |
+| 问「还剩什么」，摘要丢掉的 29 件事找回几件 | 2 | 13 |
+| 压缩后第一个回答的平均花费 | $0.39 | $0.49 |
+
+分数提高了，绝对值仍不高：20 个回答里还有 6 个犯了用户当时纠正过的错，10 次压缩里有 3 次装了反而不如不装。测的那一版比现在的提醒少三处补充（摘要偏向最近的事、不用写文件、做完要看结果并且对不上时以记录为准）。样本是一位用户的中文会话，细节和局限在 `references/compact-hook.md`。
+
+不走 skill，也可以直接装或卸：
+
+```bash
+python3 ~/.claude/skills/save-my-tokens/scripts/slim.py hook status
+python3 ~/.claude/skills/save-my-tokens/scripts/slim.py backup --paths ~/.claude/settings.json ~/.claude/hooks/save-my-tokens-compact.py
+python3 ~/.claude/skills/save-my-tokens/scripts/slim.py hook install --backup <上一步输出的备份 ID>
+python3 ~/.claude/skills/save-my-tokens/scripts/slim.py seal --backup <备份 ID>
+```
+
+`backup` 先把要动的两个路径原样存一份，输出里有备份 ID；`seal` 是改完后封存，记下改完的样子，之后才能可靠地回滚。改动在新开的会话里生效。
+
+卸掉要新开一个备份（装时那个已经封存，不能再往里加改动）：
+
+```bash
+python3 ~/.claude/skills/save-my-tokens/scripts/slim.py backup --paths ~/.claude/settings.json ~/.claude/hooks/save-my-tokens-compact.py
+python3 ~/.claude/skills/save-my-tokens/scripts/slim.py hook remove --backup <新的备份 ID>
+python3 ~/.claude/skills/save-my-tokens/scripts/slim.py seal --backup <新的备份 ID>
+```
+
+也可以 `rollback --backup <装时的备份 ID>` 退回装之前的样子，但同一次备份里的其他改动（比如关掉的 skill）会一起退回。
+
 ## 改动与回滚
 
 - 改前把要动的路径原样存进 `~/.save-my-tokens/backups/<时间戳>/`，每次新建不覆盖旧备份，权限 `0700`（可能含凭据）。
 - 改 `settings.json`、`config.toml` 由脚本按键写（单键或批量一次写回），改完重新解析并与改前逐项比对，确认只变了目标键才写回；agent 不读全文。
 - 回滚后逐项校验 sha256。文件改完后若被别人动过，回滚会停下来问而不覆盖，被替换的版本另存一份。
-- 不碰 `~/.claude.json`（Claude Code 随时在写的状态文件）、凭据和插件目录；不硬删任何东西，不装 hook，不留后台进程。往规则文件加内容（如子代理模型分工）前先给看改动，同意才加。
+- 不碰 `~/.claude.json`（Claude Code 随时在写的状态文件）、凭据和插件目录；不硬删任何东西，不留后台进程；hook 只在你同意时装压缩后提醒这一个。往规则文件加内容（如子代理模型分工）前先给看改动，同意才加。
 
 ## 运行要求
 
@@ -84,6 +125,8 @@ SKILL.md                  给 agent 看的流程
 scripts/slim.py           扫描、备份、改单个键、回滚
 references/switches.json  开关清单：默认值、说明、官方出处、核对日期
 references/windows.md     在 Windows 上跑的注意事项
+references/compact-hook.md 压缩后提醒的实测
+hooks/compact-reminder.py 压缩后提醒的 hook 脚本
 ```
 
 MIT，见 `LICENSE`。
