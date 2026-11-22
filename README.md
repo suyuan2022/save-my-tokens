@@ -31,12 +31,15 @@ python3 ~/.claude/skills/save-my-tokens/scripts/slim.py rollback
 - **开局 token**：读 Claude Code 日志，看第一次请求实际带了多少 token 以及这五块各多大（实测，不是估算）。
 - **近 30 天用量**：读 Claude Code 和 Codex 日志（含 `.jsonl.zst` 压缩旧日志），统计 skill、MCP server、subagent 调用次数；Claude Code 没用过但 Codex 在读的 skill 会标出。
 - **规则与开关**：找规则文件重复（同会话一起加载、每次多带一遍，或 Claude Code 和 Codex 各读一份、不多花钱但可能走样），查超过上限 Codex 读不到的 `AGENTS.md`，以及写错或不生效的开关（类型不对、被环境变量覆盖、超范围、版本不支持）。
-- **会话与子代理**：统计会话长度、缓存过期整段重算次数、子代理模型，用来定自动压缩窗口等设置。
+- **逐个工具**：新开会话时发给模型的每个工具（内置的、你装的 MCP、桌面 app 自带的），说明是整份常驻还是只列名字按需加载、多大、近 30 天调了几次；延迟加载没生效时指出来。
+- **会话与子代理**：统计会话长度、缓存过期整段重算次数、子代理模型，用来定自动压缩窗口等设置；另列出主会话的模型把活派给了谁，哪几次派工大到像是把整件活转包了出去（子代理自己发了上百次请求）。
 - **官方审查**：查 `/doctor prompt-audit` 能不能用、卡在哪，及背后官方说明文件的本机位置。
 
 ### 2. agent 按 `SKILL.md` 逐项确认
 
 - 「近 30 天 0 次调用」只是候选，发版、回滚这类几个月才用一次的 skill 单独标出。
+- 工具逐个确认：agent 给一张带编号的表（干什么、常驻还是按需、调用次数、建议），你按编号回，同意的才写进 `settings.json` 的 `permissions.deny`，随时拿掉。按需加载的工具只占一个名字，屏蔽它们几乎不省，表里会分开说。
+- 整件转包先问是不是你有意交出去的。是模型自己转的，再找出是哪条规则导致的，照模板按你自己的模型和场景改派子代理的规则，给看改动，同意才改。
 - 旧模型写法、指向不存在文件或互相矛盾的规则，交给官方 `/doctor prompt-audit`。就算关了它依赖的内置 skill，agent 也直接读背后公开的官方说明文件照做，不动开关。
 - 不估「省多少 token」，只报实测数：第一次请求 token、模型可见 skill 数、调用次数。改完新开会话再量一次对比。
 
@@ -117,15 +120,19 @@ python3 ~/.claude/skills/save-my-tokens/scripts/slim.py seal --backup <新的备
 - 意思相同、措辞不同的重复规则脚本找不到，靠 agent 读文件判断。
 - 开关清单只收了核对过官方文档的二十几个键，键名和默认值随版本变，每条附出处和核对日期。
 - 同名 skill 在用户级和项目级各装一份时，日志分不出实际用哪份。
+- 桌面 app 走第三方网关时工具延迟加载被关掉的判断和改法，只在 Claude Code 2.1.330 上验证过；改法要写系统目录下的托管设置，需要管理员密码，命令由你自己跑。
+- 一次派工是你有意整件交出去的，还是模型自己转的，日志分不出，要 agent 问你。
 
 ## 目录与许可
 
 ```text
 SKILL.md                  给 agent 看的流程
-scripts/slim.py           扫描、备份、改单个键、回滚
+scripts/slim.py           扫描、备份、改单个键、屏蔽工具、回滚
 references/switches.json  开关清单：默认值、说明、官方出处、核对日期
 references/windows.md     在 Windows 上跑的注意事项
 references/compact-hook.md 压缩后提醒的实测
+references/tool-search.md 工具延迟加载没生效时的判断和改法
+references/subagent-rules.md 派子代理规则的模板和填法
 hooks/compact-reminder.py 压缩后提醒的 hook 脚本
 ```
 

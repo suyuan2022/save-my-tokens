@@ -347,6 +347,7 @@ CWD_RE = re.compile(rb'"cwd":\s*"((?:[^"\\]|\\.)*)"')
 VER_RE = re.compile(rb'"version":\s*"(\d+\.\d+\.\d+)"')
 CMD_RE = re.compile(r"<command-name>/?([^<\s]+)</command-name>")
 CC_NEEDLES = (b'"Skill"', b'"Agent"', b'"Task"', b'"mcp__')
+TOOL_USE_RE = re.compile(rb'"type":\s*"tool_use",\s*"id":\s*"([^"]+)",\s*"name":\s*"([^"]+)"')
 
 
 TS_RE = re.compile(rb'"timestamp":\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)')
@@ -390,7 +391,7 @@ def note_head(head, line):
         if head["tools"] is not None:
             return          # 只看第一份：后面的是会话中途工具变了之后的
         parts["system"] = str_chars(shape.get("system"))
-        tools = {"builtin": {"n": 0, "chars": 0}, "mcp": {}}
+        tools = {"builtin": {"n": 0, "chars": 0}, "mcp": {}, "items": []}
         for t in shape.get("tools") or []:
             if not isinstance(t, dict):
                 continue
@@ -402,6 +403,8 @@ def note_head(head, line):
                 srv = tools["builtin"]
             srv["n"] += 1
             srv["chars"] += size
+            if name and name != "DeferredToolPlaceholder":
+                tools["items"].append([name, size])       # 只记名字和大小，说明原文不留
         head["tools"] = tools
         parts["builtin_tools"] = tools["builtin"]["chars"]
         parts["mcp_tools"] = sum(v["chars"] for v in tools["mcp"].values())
@@ -410,6 +413,8 @@ def note_head(head, line):
     if rec.get("type") != "attachment" or not isinstance(a, dict):
         return
     kind = a.get("type")
+    if isinstance(rec.get("entrypoint"), str):
+        head["entrypoint"] = rec["entrypoint"]
     if kind == "skill_listing":
         if a.get("isInitial") and isinstance(a.get("content"), str):
             head["listing"] = True
@@ -426,6 +431,7 @@ def note_head(head, line):
     elif kind == "deferred_tools_delta":
         parts["deferred"] = parts.get("deferred", 0) + str_chars(a.get("addedLines"))
         head["deferred_n"] = head.get("deferred_n", 0) + len(a.get("addedNames") or [])
+        head.setdefault("deferred_names", []).extend(str(n) for n in a.get("addedNames") or [] if isinstance(n, str))
     elif kind == "agent_listing_delta":
         parts["agents"] = parts.get("agents", 0) + str_chars(a.get("addedLines"))
     elif kind == "hook_success":
@@ -485,17 +491,21 @@ def scan_claude_logs(home, cutoff):
     r = {"present": os.path.isdir(root), "files": 0, "bytes": 0, "older_evidence": False, "earliest": "",
          "unreadable": 0, "version": None, "cwds": Counter(), "skill_model": {}, "skill_user": {},
          "agents": {}, "mcp": {}, "listings": [],
+         "tool_calls": Counter(),                        # 每个工具（内置的和 MCP 的）被调了几次
          # 下面几样都是从日志里的用量数字直接数出来的
          "starts": [],                                   # 每个新会话的第一次请求
          "req": {"main": {}, "sub": {}},                 # 请求数和输入 token，按模型
          "bins": Counter(), "bin_tokens": Counter(),     # 主会话请求按大小分档
          "peaks": [],                                    # 每个会话文件里最大的一次请求
          "rewrites": {},                                 # 没命中缓存、整段重算的请求
-         "agent_model": Counter()}                       # 派子代理时指定了什么模型
+         "agent_model": Counter(),                       # 派子代理时指定了什么模型
+         "dispatches": [],                               # 主会话每一次派子代理：谁派的、派给谁、标题
+         "sub_runs": {}}                                 # 每个子代理自己发了多少次请求，按派它的那次调用的 id
     if not r["present"]:
         return r
     seen = set()
     seen_msg = set()
+    seen_tu = set()
     for p, mtime, size, inwin in iter_jsonl(root, cutoff):
         if not inwin:
             r["older_evidence"] = True
@@ -504,6 +514,7 @@ def scan_claude_logs(home, cutoff):
         file_cwd = None
         head = None if is_sub else {"parts": {}, "files": [], "tools": None, "listing": False, "lines": 0}
         prev_ts, prev_model, peak, copied, file_msgs = None, None, 0, False, set()
+        sub_models = Counter()
         try:
             fh = open_log(p)
         except OSError:
@@ -562,6 +573,8 @@ def scan_claude_logs(home, cutoff):
                         side = is_sub or b'"isSidechain":true' in line or b'"isSidechain": true' in line
                         inwin_req = not uts or uts >= cutoff_iso
                         if ctx and model != "<synthetic>":
+                            if is_sub:
+                                sub_models[model] += 1
                             if inwin_req:
                                 slot = r["req"]["sub" if side else "main"].setdefault(model, {"n": 0, "tokens": 0})
                                 slot["n"] += 1
@@ -577,7 +590,9 @@ def scan_claude_logs(home, cutoff):
                                             r["starts"].append({
                                                 "ts": uts, "cwd": file_cwd or "", "tokens": ctx, "model": model,
                                                 "parts": head["parts"], "files": head["files"], "tools": head["tools"],
-                                                "skill_count": head.get("skill_count"), "deferred_n": head.get("deferred_n")})
+                                                "skill_count": head.get("skill_count"), "deferred_n": head.get("deferred_n"),
+                                                "deferred_names": head.get("deferred_names") or [],
+                                                "entrypoint": head.get("entrypoint")})
                                     elif ctx >= BIG_REWRITE and cr < ctx * 0.1:
                                         gap = iso_to_ts(uts) - iso_to_ts(prev_ts) if uts and prev_ts else 0
                                         why = ("换了模型" if model != prev_model else "隔了 1 小时以上" if gap > 3600
@@ -602,6 +617,13 @@ def scan_claude_logs(home, cutoff):
                             r["listings"].append({"ts": lts, "count": a.get("skillCount") or len(names),
                                                   "chars": len(a["content"]), "cwd": att.get("cwd") or file_cwd or ""})
                     continue
+                if b'"tool_use"' in line and b'"assistant"' in line:
+                    tss = TS_RE.findall(line)
+                    if not tss or tss[-1].decode() >= cutoff_iso:
+                        for tid, tname in TOOL_USE_RE.findall(line):
+                            if tid not in seen_tu:
+                                seen_tu.add(tid)
+                                r["tool_calls"][tname.decode("utf-8", "replace")] += 1
                 is_tool = b'"tool_use"' in line and any(n in line for n in CC_NEEDLES)
                 is_cmd = (not is_tool) and b"<command-name>" in line
                 if not (is_tool or is_cmd):
@@ -633,6 +655,11 @@ def scan_claude_logs(home, cutoff):
                             bump(r["skill_model"], str(inp["skill"]), ts, cwd)
                         elif name in ("Agent", "Task"):
                             r["agent_model"][str(inp.get("model") or "")] += 1
+                            if not is_sub and not rec.get("isSidechain") and bid:
+                                r["dispatches"].append({
+                                    "id": bid, "ts": ts, "cwd": cwd or "", "main": str(msg.get("model") or "?"),
+                                    "to": str(inp.get("model") or ""), "type": str(inp.get("subagent_type") or ""),
+                                    "title": clip(str(inp.get("description") or ""), 80)})
                             if inp.get("subagent_type"):
                                 bump(r["agents"], str(inp["subagent_type"]), ts, cwd)
                         elif name.startswith("mcp__"):
@@ -663,6 +690,14 @@ def scan_claude_logs(home, cutoff):
                         bump(r["skill_user"], n, ts, cwd)
         if peak:
             r["peaks"].append(peak)
+        if is_sub and sub_models:
+            # 子代理日志旁边的 .meta.json 记着它是主会话哪一次 Agent 调用派出来的
+            meta, _e = load_json_file(re.sub(r"\.jsonl(\.zst)?$", "", p) + ".meta.json")
+            tid = meta.get("toolUseId") if isinstance(meta, dict) else None
+            if isinstance(tid, str):
+                run = r["sub_runs"].setdefault(tid, {"reqs": 0, "models": Counter()})
+                run["reqs"] += sum(sub_models.values())
+                run["models"].update(sub_models)
     return r
 
 
@@ -1013,6 +1048,76 @@ def skill_group(s):
     return "E"
 
 
+BIG_HANDOFF = 100     # 子代理自己发了这么多次请求，算「大派工」。依据见 delegation_summary 的说明
+
+
+def delegation_summary(dispatches, sub_runs):
+    """主会话派子代理的账：按主模型分，派给各模型多少次；哪些派工大到像是把整件活交了出去。
+    一次派工有多大，看那个子代理自己向模型发了多少次请求（它的日志里带用量的回复条数）。
+    阈值取 100：查一个事实、搜几个文件、读材料出摘要这类分出去的小活，通常几次到几十次请求就交回；
+    上百次请求意味着子代理自己读了、改了、验了一长串，计划和中途的决定多半也是它做的。
+    这只是把候选挑出来，是不是用户有意整件交出去的，脚本分不出来。"""
+    if not dispatches:
+        return None
+    by_main = {}
+    rows = []
+    for d in dispatches:
+        run = sub_runs.get(d["id"])
+        to = d["to"] or (run["models"].most_common(1)[0][0] if run else "")
+        slot = by_main.setdefault(d["main"], {"n": 0, "to": Counter()})
+        slot["n"] += 1
+        slot["to"][d["to"] or "（没指定）"] += 1
+        if run:
+            rows.append({"ts": d["ts"], "cwd": d["cwd"], "main": d["main"], "to": to, "type": d["type"],
+                         "title": d["title"], "reqs": run["reqs"]})
+    sizes = sorted(r["reqs"] for r in rows)
+    big = sorted([r for r in rows if r["reqs"] >= BIG_HANDOFF], key=lambda r: -r["reqs"])
+    return {"total": len(dispatches), "measured": len(rows), "threshold": BIG_HANDOFF,
+            "by_main": {m: {"n": v["n"], "to": dict(v["to"].most_common())} for m, v in
+                        sorted(by_main.items(), key=lambda kv: -kv[1]["n"])},
+            "median_reqs": quantile(sizes, 0.5) if sizes else None, "max_reqs": sizes[-1] if sizes else None,
+            "big_n": len(big), "big": big[:20],
+            # 最近的几件小活：给规则里的例子当素材
+            "small": sorted([r for r in rows if r["reqs"] < BIG_HANDOFF], key=lambda r: r["ts"], reverse=True)[:12]}
+
+
+BARE_TOOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+
+
+def tool_server(name):
+    parts = name.split("__", 2)
+    return parts[1] if name.startswith("mcp__") and len(parts) == 3 else None
+
+
+def tools_table(start, calls, deny):
+    """最近一次有记录的新开会话里，发给模型的每个工具：整份带着（常驻）还是只列了名字（按需）、多大、近期调了几次。
+    常驻的来自那次请求的工具清单；按需的来自 Claude Code 记下的「延迟加载的工具名」。"""
+    if not start or not (start.get("tools") or {}).get("items"):
+        return None
+    loaded = [(n, c) for n, c in start["tools"]["items"]]
+    names = set(n for n, _c in loaded)
+    lazy = sorted(set(n for n in start.get("deferred_names") or [] if n not in names))
+    rows = [{"name": n, "server": tool_server(n), "load": "常驻", "chars": c} for n, c in loaded]
+    rows += [{"name": n, "server": tool_server(n), "load": "按需", "chars": None} for n in lazy]
+    # 同一个来源的排在一起（编号连着，用户才能说「12–20 整组关」）：常驻说明最大的来源在前；来源内先常驻（从大到小）后按需
+    weight_ = Counter()
+    for r in rows:
+        weight_[r["server"] or ""] += r["chars"] or 0
+    rows.sort(key=lambda r: (-weight_[r["server"] or ""], r["server"] or "", r["load"] != "常驻", -(r["chars"] or 0), r["name"]))
+    denied = set(d for d in deny if isinstance(d, str))
+    for i, r in enumerate(rows):
+        r["n"] = i + 1
+        r["calls"] = calls.get(r["name"], 0)
+        # 这份清单是那次会话当时的；之后才加进 permissions.deny 的，标出来
+        r["denied"] = r["name"] in denied or bool(r["server"] and "mcp__" + r["server"] in denied)
+    return {"ts": start.get("ts"), "cwd": start.get("cwd"), "entrypoint": start.get("entrypoint"),
+            # ToolSearch 这个工具在场，就是延迟加载开着；不在场时，「按需」名单里的工具其实也整份带着
+            "tool_search": "ToolSearch" in names,
+            "listed_but_loaded": len([n for n in start.get("deferred_names") or [] if n in names]),
+            "items": rows,
+            "deny": sorted(d for d in deny if isinstance(d, str) and BARE_TOOL_RE.match(d))}
+
+
 def startup_summary(starts, now):
     """新开会话第一次请求的实测。只留统计和最近一次的明细，不把每个会话都写进 json。"""
     if not starts:
@@ -1278,11 +1383,24 @@ def do_scan(args, home):
 
     # ---- 实测：开局带了多少、会话长到多大、哪个模型在跑
     claude["startup"] = startup_summary(cl.get("starts") or [], now)
+    st_ = claude["startup"]
+    perms = settings.get("permissions") if isinstance(settings.get("permissions"), dict) else {}
+    deny_ = perms.get("deny") if isinstance(perms.get("deny"), list) else []
+    pick = ((st_.get("focus") if (st_.get("focus") or {}).get("tools") else st_.get("latest")) if st_ else None)
+    claude["tools"] = tools_table(pick, cl.get("tool_calls") or {}, deny_)
+    # 不同入口（命令行、桌面 app、IDE）开的会话，工具清单不一样：每个别的入口各留最近一次
+    alt = {}
+    for s_ in sorted(cl.get("starts") or [], key=lambda x: x["ts"]):
+        ep = s_.get("entrypoint")
+        if ep and claude["tools"] and ep != claude["tools"].get("entrypoint") and (s_.get("tools") or {}).get("items"):
+            alt[ep] = s_
+    claude["tools_alt"] = {ep: tools_table(s_, cl.get("tool_calls") or {}, deny_) for ep, s_ in alt.items()}
     claude["context"] = context_summary(cl)
     claude["requests_by_model"] = cl.get("req") or {"main": {}, "sub": {}}
     am = cl.get("agent_model") or Counter()
     claude["agent_calls"] = {"total": sum(am.values()), "no_model": am.get("", 0),
                              "by_model": {k: v for k, v in am.most_common() if k}}
+    claude["delegation"] = delegation_summary(cl.get("dispatches") or [], cl.get("sub_runs") or {})
     claude["auto_memory"] = auto_memory(c_dir, settings, env, list(cl["cwds"])) if has_claude else None
     ms = settings.get("modelSettings") if isinstance(settings.get("modelSettings"), dict) else {}
     claude["compact_window"] = {
@@ -1360,6 +1478,12 @@ def do_scan(args, home):
     gateway = bool(env.get("ANTHROPIC_BASE_URL")) and "anthropic.com" not in str(env.get("ANTHROPIC_BASE_URL"))
     if gateway and vt and vt < (2, 1, 181) and str(env.get("CLAUDE_CODE_ATTRIBUTION_HEADER")) != "0":
         problems.append("走自定义网关且版本低于 2.1.181：系统提示词开头带每次请求都变的标记，会破坏网关侧缓存。升级，或设 CLAUDE_CODE_ATTRIBUTION_HEADER=0。")
+    for tt in [claude.get("tools")] + [t for _ep, t in sorted((claude.get("tools_alt") or {}).items())]:
+        if not (tt and not tt["tool_search"] and any(r["server"] for r in tt["items"] if r["load"] == "常驻")
+                and str(env.get("ENABLE_TOOL_SEARCH", "")).lower() != "false"):
+            continue
+        notes.append("工具延迟加载没生效：%s新开的会话里 MCP 工具说明是整份带着的，而 ENABLE_TOOL_SEARCH 并没有被设成 false%s。原因和改法见 skill 目录下的 references/tool-search.md。" % (
+            md(tt["ts"]) + " ", "；这个会话是桌面 app 走第三方网关开的（entrypoint=claude-desktop-3p），正是那份文件讲的情况" if tt.get("entrypoint") == "claude-desktop-3p" else ""))
     for m in mcps:
         if m["alwaysLoad"]:
             notes.append("MCP %s 设了 alwaysLoad：它的工具说明每轮常驻，不走延迟加载（近 %d 天调用 %d 次）。" % (m["name"], args.days, m["calls"]))
@@ -1447,16 +1571,22 @@ def do_scan(args, home):
         codex["mcp"] = xm
         codex["other_mcp_calls"] = {k: v["n"] for k, v in cx.get("mcp", {}).items() if norm_server(k) not in matched}
         sk_cfg = (cfg.get("skills") or {}).get("config") if isinstance(cfg.get("skills"), dict) else None
-        disabled = set()
+        # 停用条目有两种写法：按 path、按 name。path 先解析成真实路径再比：
+        # ~/.codex/skills 是指向别处的软链时，配置里写的常常是软链另一头的路径
+        disabled, disabled_real = set(), set()
         for e in sk_cfg or []:
             if isinstance(e, dict) and e.get("enabled") is False:
-                disabled.add(e.get("path") or e.get("name"))
+                if isinstance(e.get("path"), str) and e["path"]:
+                    disabled_real.add(os.path.realpath(expand(e["path"], home)))
+                if isinstance(e.get("name"), str) and e["name"]:
+                    disabled.add(e["name"])
         xs = list_skills(os.path.join(x_dir, "skills"), "codex")
         for s in xs:
             track(s["md"])
             u = sr.get(s["dir"], sr.get(s["name"], new_use()))
             s["reads"], s["last"] = u["n"], u["last"]
-            s["enabled"] = not (s["md"] in disabled or s["path"] in disabled or s["name"] in disabled)
+            s["enabled"] = not (os.path.realpath(s["md"]) in disabled_real or os.path.realpath(s["path"]) in disabled_real
+                                or s["name"] in disabled or s["dir"] in disabled)
             flags = []
             if s["reads"] == 0:
                 if RARE_RE.search(s["dir"] + " " + s["desc"]):
@@ -1697,6 +1827,7 @@ def render(ev, home, show_all):
             L.append("日志里出现、但不在上面配置里的 MCP（插件带的、别的项目的或已移除的）：" + "、".join("%s %d" % kv for kv in sorted(c["other_mcp_calls"].items(), key=lambda kv: -kv[1])[:8]))
         if c["plugins_enabled"]:
             L.append("启用的插件（它们带的 skill / MCP 归插件管理器管，这里不动）：" + "、".join(c["plugins_enabled"]))
+        render_tools(L, c, home, days)
 
         L.append("")
         L.append("== Subagent（Claude Code）==")
@@ -1912,7 +2043,7 @@ PART_NAMES = (
     ("deferred", "延迟加载的工具名单"), ("agents", "subagent 名单"), ("other", "其他附带信息（环境、沙箱说明等）"),
 )
 PART_CAN = {
-    "rules": "能瘦：见下面「规则文件」", "skills": "能减：见下面「Skill」", "mcp_tools": "能减：停掉不用的 MCP；想留着的，看「开关」里 ENABLE_TOOL_SEARCH 是不是被设成了 false",
+    "rules": "能瘦：见下面「规则文件」", "skills": "能减：见下面「Skill」", "mcp_tools": "能减：先看下面「工具（Claude Code，逐个）」里延迟加载开没开，再逐个工具定去留",
     "builtin_tools": "基本是固定的", "system": "固定的", "hooks": "看 hook 是不是还需要", "mcp_notes": "停掉不用的 MCP 就没了",
     "deferred": "停掉不用的 MCP 会变短", "agents": "删掉不用的 subagent 会变短", "other": "基本是固定的",
 }
@@ -1981,6 +2112,54 @@ def render_startup(L, c, home, days):
     L.append("怎么用这一块：先砍排在前面、而且「能瘦」「能减」的。改完后新开一个会话说一句话，再扫一次，对比这里的第一次请求 token。")
 
 
+def tool_groups(tt):
+    g = {}
+    for r in tt["items"]:
+        d = g.setdefault(r["server"] or "（内置）", {"loaded": 0, "chars": 0, "lazy": 0, "calls": 0})
+        if r["load"] == "常驻":
+            d["loaded"] += 1
+            d["chars"] += r["chars"] or 0
+        else:
+            d["lazy"] += 1
+        d["calls"] += r["calls"]
+    return sorted(g.items(), key=lambda kv: (-kv[1]["chars"], -kv[1]["lazy"], kv[0]))
+
+
+def render_tools(L, c, home, days):
+    tt = c.get("tools")
+    L.append("")
+    L.append("== 工具（Claude Code，逐个）==")
+    if not tt:
+        L.append("日志里没有记下新开会话时发给模型的工具清单，逐个工具的大小和「常驻还是按需」量不出来。")
+        L.append("替代办法：让用户新开一个会话，输入 /context，把 MCP tools 那一栏展开后的列表贴过来。")
+        return
+    items = tt["items"]
+    hot = [r for r in items if r["load"] == "常驻"]
+    L.append("拿 %s 在 %s 新开的那个会话来看（Claude Code 记在日志里的工具清单）：整份带着的（常驻）%d 个，共 %s 字符；只列了名字、用到才加载的（按需）%d 个。" % (
+        md(tt["ts"]), show(tt["cwd"], home) if tt.get("cwd") else "目录未知", len(hot), num(sum(r["chars"] or 0 for r in hot)), len(items) - len(hot)))
+    if tt["tool_search"]:
+        L.append("延迟加载：开着。按需的工具每个只占一个名字，屏蔽它们几乎不省；要省，看常驻的。")
+    else:
+        L.append("延迟加载：没开。所有工具的说明都整份带着%s。先弄清为什么没开（见「开关」一节），它一开，多数 MCP 工具就变成按需。" % (
+            "（其中 %d 个 Claude Code 列进了延迟名单，实际仍整份发了出去）" % tt["listed_but_loaded"] if tt.get("listed_but_loaded") else ""))
+    for ep, t in sorted((c.get("tools_alt") or {}).items()):
+        if t["tool_search"] != tt["tool_search"]:
+            L.append("注意：上面说的是入口 %s 的会话。入口 %s 的会话里延迟加载%s，用户平时用哪个入口，就看哪个。" % (
+                tt.get("entrypoint") or "未知", ep, "开着" if t["tool_search"] else "没开"))
+    L.append("按来源（常驻的从大到小；调用次数是近 %d 天）：" % days)
+    for name, d in tool_groups(tt):
+        L.append("  - %s：常驻 %d 个 %s 字符，按需 %d 个，调用 %d 次" % (name, d["loaded"], num(d["chars"]), d["lazy"], d["calls"]))
+    if tt["deny"]:
+        L.append("已经屏蔽的（settings.json 的 permissions.deny 里的工具名）：" + "、".join(tt["deny"]))
+    if any(r["denied"] for r in items):
+        L.append("上面这份清单是那次会话当时的，其中 %d 个之后已经屏蔽，新会话里不会再有。" % len([r for r in items if r["denied"]]))
+    L.append("逐个工具的编号表：slim tools --scan <这次的 json>。连接得晚的 MCP server、会话中途才出现的工具不在这份清单里。")
+    for ep, t in sorted((c.get("tools_alt") or {}).items()):
+        h = [r for r in t["items"] if r["load"] == "常驻"]
+        L.append("别的入口开的会话工具清单不一样：%s（%s，常驻 %d 个 %s 字符，按需 %d 个，延迟加载%s）。看它的编号表：slim tools --scan <json> --entry %s" % (
+            ep, md(t["ts"]), len(h), num(sum(r["chars"] or 0 for r in h)), len(t["items"]) - len(h), "开着" if t["tool_search"] else "没开", ep))
+
+
 def render_config(L, c, days):
     cx = c.get("context")
     cw = c.get("compact_window") or {}
@@ -2022,7 +2201,7 @@ def render_config(L, c, days):
     elif cx:
         L.append("近 %d 天没看到「10 万 token 以上的历史整段重算」的请求。" % days)
     L.append("")
-    L.append("== 子代理用什么模型 ==")
+    L.append("== 子代理：交出去什么、用什么模型 ==")
     rq = c.get("requests_by_model") or {}
     for kind, name in (("main", "主会话"), ("sub", "子代理")):
         rows = sorted((rq.get(kind) or {}).items(), key=lambda kv: -kv[1]["tokens"])
@@ -2036,6 +2215,23 @@ def render_config(L, c, days):
         L.append("  怎么读：查资料、搜文件、读日志这类活用便宜的模型就够。没指定模型的子代理会用主会话那个最贵的。")
     elif not (rq.get("sub")):
         L.append("近 %d 天没有派过子代理。" % days)
+    dg = c.get("delegation")
+    if dg:
+        L.append("谁派给谁（主会话当时用的模型 → 派工时指定的模型）：")
+        for m, v in list(dg["by_main"].items())[:4]:
+            L.append("  - %s 派了 %d 次：%s" % (m, v["n"], "、".join("%s %d" % kv for kv in list(v["to"].items())[:5])))
+        if dg["measured"]:
+            L.append("一次派工有多大，看子代理自己发了多少次请求：对得上日志的 %d 次里，中位数 %d 次，最大 %d 次。" % (
+                dg["measured"], dg["median_reqs"], dg["max_reqs"]))
+        if dg["big_n"]:
+            L.append("其中 %d 次的子代理发了 %d 次以上请求，像是把整件活交了出去（最大的几次）：" % (dg["big_n"], dg["threshold"]))
+            for r in dg["big"][:8]:
+                L.append("  - %s  %s → %s  %d 次请求  「%s」%s" % (md(r["ts"]), r["main"], r["to"] or "没指定", r["reqs"], r["title"],
+                                                             "（%s）" % r["type"] if r["type"] else ""))
+            L.append("  怎么读：这些是候选。是用户自己说要整件交给后台做的，还是模型照规则文件自己转出去的，日志分不出来，要问用户。"
+                     "整件转出去时，定计划、中途拿主意、下结论的就不是用户选的那个模型了。")
+        elif dg["measured"]:
+            L.append("没有哪次派工的子代理发到 %d 次请求：分出去的都是小活。" % dg["threshold"])
 
 
 # ---------------------------------------------------------------- 备份 / 回滚
@@ -2603,6 +2799,110 @@ def cmd_show(args, home):
         if s.get("referenced_by"):
             bits.append("引用它的：" + "、".join(show(p, home) for p in s["referenced_by"][:2]))
         print("  - %s [%s]" % (s["name"], "，".join(bits)))
+
+
+def load_tools(scan_path, entry=None):
+    ev, err = load_json_file(scan_path)
+    if not isinstance(ev, dict) or "claude" not in ev:
+        die("%s 不是 scan --json 写出的文件（%s）。" % (scan_path, err or "格式不对"))
+    tt = ev["claude"].get("tools")
+    if entry and not (tt and tt.get("entrypoint") == entry):
+        alt = ev["claude"].get("tools_alt") or {}
+        if entry not in alt:
+            die("这份扫描里没有入口 %s 的工具清单。有的是：%s。" % (entry, "、".join(
+                ([str(tt.get("entrypoint"))] if tt else []) + sorted(alt)) or "（无）"))
+        tt = alt[entry]
+    if not tt:
+        die("这份扫描里没有逐个工具的清单（日志没记）。请用户新开一个会话输入 /context，把 MCP tools 一栏展开后的列表贴过来，照那份列表做。")
+    return tt, ev
+
+
+def cmd_tools(args, home):
+    """从 scan 的 json 里取逐个工具的编号表。编号在同一份 json 里固定，筛选不改变编号。"""
+    tt, ev = load_tools(args.scan, args.entry)
+    rows = tt["items"]
+    if args.server:
+        want = set(norm_server(s) for s in args.server)
+        rows = [r for r in rows if norm_server(r["server"] or "builtin") in want]
+    if args.loaded:
+        rows = [r for r in rows if r["load"] == "常驻"]
+    print("新开会话时发给模型的工具（%s 的会话%s；延迟加载%s；调用次数是近 %d 天）。%s" % (
+        md(tt["ts"]), "，入口 " + tt["entrypoint"] if tt.get("entrypoint") else "", "开着" if tt["tool_search"] else "没开", ev.get("days", 30),
+        "「常驻」整份带着，「按需」只占一个名字。" if tt["tool_search"] else "延迟加载没开，所有工具都整份带着。"))
+    print("编号  加载  字符  调用  工具名")
+    for r in rows:
+        print("%3d  %s  %6s  %4d  %s%s" % (r["n"], r["load"], num(r["chars"]) if r["chars"] is not None else "-", r["calls"], r["name"],
+                                           "  （之后已屏蔽）" if r.get("denied") else ""))
+    if not rows:
+        print("（没有符合条件的工具）")
+    if tt["deny"]:
+        print("已经屏蔽的：" + "、".join(tt["deny"]))
+
+
+def parse_nums(specs, top):
+    out = []
+    for spec in specs:
+        for part in str(spec).replace("，", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            m = re.match(r"^(\d+)(?:-(\d+))?$", part)
+            if not m:
+                die("编号 %r 看不懂。写成 3、5-8 这样。没有改。" % part)
+            a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+            if not (1 <= a <= b <= top):
+                die("编号 %s 超出范围（这份扫描里是 1 到 %d）。没有改。" % (part, top))
+            out.extend(range(a, b + 1))
+    return out
+
+
+def cmd_deny(args, home):
+    """屏蔽（或恢复）工具：只动 ~/.claude/settings.json 的 permissions.deny，别的键不碰。
+    单个工具写工具名，整个 MCP server 写 mcp__<server>。"""
+    names = list(args.names or [])
+    tt = None
+    if args.scan:
+        tt, _ev = load_tools(args.scan, args.entry)
+    if args.nums:
+        if not tt:
+            die("用 --nums 要同时给 --scan <scan --json 写出的文件>：编号是那份扫描里的编号。")
+        by_n = {r["n"]: r["name"] for r in tt["items"]}
+        names += [by_n[n] for n in parse_nums(args.nums, len(by_n))]
+    for srv in args.server or []:
+        names.append(srv if srv.startswith("mcp__") else "mcp__" + srv)
+    names = [n for i, n in enumerate(names) if n not in names[:i]]
+    if not names:
+        die("没有要屏蔽的工具：给工具名、--nums 编号，或 --server <名字>。")
+    bad = [n for n in names if not BARE_TOOL_RE.match(n)]
+    if bad:
+        die("这些不是工具名：%s。这里只收完整的工具名（如 NotebookEdit、mcp__lsp__hover）或 mcp__<server>；"
+            "Bash(…) 这类权限规则用 slim set 改。没有改。" % "、".join(bad))
+    settings_path = os.path.join(claude_dir(home), "settings.json")
+    cur, _e = load_json_file(settings_path)
+    perms = cur.get("permissions") if isinstance(cur, dict) and isinstance(cur.get("permissions"), dict) else {}
+    deny = perms.get("deny") if isinstance(perms.get("deny"), list) else []
+    if "deny" in perms and not isinstance(perms.get("deny"), list):
+        die("settings.json 的 permissions.deny 不是数组，没有改。")
+    if args.remove:
+        gone = [n for n in names if n not in deny]
+        if gone:
+            die("permissions.deny 里没有这些：%s。没有改。" % "、".join(gone))
+        new = [d for d in deny if d not in names]
+    else:
+        if tt:
+            known = set(r["name"] for r in tt["items"]) | set("mcp__" + r["server"] for r in tt["items"] if r["server"])
+            typo = [n for n in names if n not in known]
+            if typo:
+                die("这份扫描的工具清单里没有：%s。没有改。拼错的名字写进 permissions.deny 不会报错，只会悄悄不生效；"
+                    "确实要屏蔽清单外的工具（连接得晚的 MCP server 的），去掉 --scan 再点名。" % "、".join(typo))
+        new = deny + [n for n in names if n not in deny]
+    apply_edits(home, args.backup, settings_path, [(["permissions", "deny"], new, False)])
+    print("%s %d 个：%s" % ("恢复了" if args.remove else "屏蔽了", len(names), "、".join(names)))
+    if not args.remove and tt and tt["tool_search"]:
+        lazy = set(r["name"] for r in tt["items"] if r["load"] == "按需")
+        n_lazy = len([n for n in names if n in lazy])
+        if n_lazy:
+            print("其中 %d 个本来就是按需加载的，只占一个名字，屏蔽它们几乎不省上下文。" % n_lazy)
 
 
 def apply_edits(home, backup_id, file_arg, edits, summary=None):
@@ -3245,6 +3545,19 @@ def main():
     sh.add_argument("--scan", required=True)
     sh.add_argument("--group", required=True)
     sh.add_argument("--names", action="store_true", help="只打印名字")
+    tl = sub.add_parser("tools", help="从 scan 的 json 里取逐个工具的编号表")
+    tl.add_argument("--scan", required=True)
+    tl.add_argument("--server", nargs="*", help="只看这几个 MCP server 的工具；内置工具写 builtin")
+    tl.add_argument("--loaded", action="store_true", help="只看常驻的")
+    tl.add_argument("--entry", help="看另一个入口的会话的清单（报告里列了有哪些）")
+    dn = sub.add_parser("deny", help="屏蔽工具（只写 settings.json 的 permissions.deny）")
+    dn.add_argument("--backup", required=True)
+    dn.add_argument("names", nargs="*", help="完整的工具名")
+    dn.add_argument("--scan", help="scan --json 写出的文件：按它的工具清单核对名字，配合 --nums 用")
+    dn.add_argument("--nums", nargs="*", help="slim tools 表里的编号，如 3 5-8")
+    dn.add_argument("--entry", help="编号取自哪个入口的表（和 slim tools 用的一致）")
+    dn.add_argument("--server", nargs="*", help="整个 MCP server 一起屏蔽")
+    dn.add_argument("--remove", action="store_true", help="从 permissions.deny 里拿掉（恢复）")
     mv = sub.add_parser("move", help="搬文件或目录")
     mv.add_argument("--backup", required=True)
     mv.add_argument("--src", required=True)
@@ -3280,7 +3593,8 @@ def main():
             die("自检没通过，这台机器上 backup / set / rollback 不安全，已拒绝。只用 scan 看报告，改动请手动做。")
     fn = {"scan": do_scan, "backup": cmd_backup, "set": cmd_set, "move": cmd_move, "seal": cmd_seal,
           "rollback": cmd_rollback, "list": cmd_list, "status": cmd_status,
-          "skills": cmd_skills, "show": cmd_show, "compare": cmd_compare, "hook": cmd_hook}.get(args.cmd)
+          "skills": cmd_skills, "show": cmd_show, "compare": cmd_compare, "hook": cmd_hook,
+          "tools": cmd_tools, "deny": cmd_deny}.get(args.cmd)
     if not fn:
         ap.print_help()
         sys.exit(1)
