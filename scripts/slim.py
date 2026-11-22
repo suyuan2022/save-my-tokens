@@ -2987,15 +2987,25 @@ def cmd_move(args, home):
     print("已搬 %s → %s" % (show(src, home), show(dst, home)))
 
 
-# ------------------------------------------------------------------ 压缩后提醒 hook
+# ------------------------------------------------------------------ 压缩前后的两个 hook
 
-HOOK_NAME = "save-my-tokens-compact.py"
-HOOK_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "compact-reminder.py")
+_HOOK_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks")
+# after：压缩完那一刻往模型上下文里放一段提醒。before：压缩前给写摘要的模型加几句要求。
+HOOK_SPECS = {
+    "after": {"name": "save-my-tokens-compact.py", "src": os.path.join(_HOOK_DIR, "compact-reminder.py"),
+              "event": "SessionStart", "matcher": "compact", "label": "压缩后提醒", "other": "压缩后 hook",
+              "clash": "两段提醒会一起出现",
+              "what": "每次压缩后放进模型上下文，{路径} 换成压缩前完整记录的位置"},
+    "before": {"name": "save-my-tokens-precompact.py", "src": os.path.join(_HOOK_DIR, "precompact-instructions.py"),
+               "event": "PreCompact", "matcher": None, "label": "压缩前要求", "other": "压缩前 hook",
+               "clash": "两边打印的话都会交给写摘要的模型",
+               "what": "每次压缩前交给写摘要的模型，附在 Claude Code 自带的摘要要求后面"},
+}
 
 
-def hook_paths(home):
+def hook_paths(home, spec):
     cd = claude_dir(home)
-    return os.path.join(cd, "settings.json"), os.path.join(cd, "hooks", HOOK_NAME)
+    return os.path.join(cd, "settings.json"), os.path.join(cd, "hooks", spec["name"])
 
 
 def hook_command(target):
@@ -3024,30 +3034,31 @@ def read_settings(path):
     return bom, body, obj
 
 
-def session_start_groups(obj):
+def event_groups(obj, event):
     hooks = obj.get("hooks", {})
     if not isinstance(hooks, dict):
         die("settings.json 里的 hooks 不是对象，没有改。请手动看一下。")
-    groups = hooks.get("SessionStart", [])
+    groups = hooks.get(event, [])
     if not isinstance(groups, list):
-        die("settings.json 里的 hooks.SessionStart 不是数组，没有改。请手动看一下。")
+        die("settings.json 里的 hooks.%s 不是数组，没有改。请手动看一下。" % event)
     return hooks, groups
 
 
-def is_ours(h):
-    return isinstance(h, dict) and HOOK_NAME in str(h.get("command", ""))
+def is_ours(h, spec):
+    return isinstance(h, dict) and spec["name"] in str(h.get("command", ""))
 
 
-def hook_report(home):
-    settings, target = hook_paths(home)
+def hook_report(home, spec):
+    settings, target = hook_paths(home, spec)
     _bom, _body, obj = read_settings(settings)
-    _hooks, groups = session_start_groups(obj)
-    ours = any(is_ours(h) for g in groups if isinstance(g, dict) for h in g.get("hooks") or [])
+    _hooks, groups = event_groups(obj, spec["event"])
+    ours = any(is_ours(h, spec) for g in groups if isinstance(g, dict) for h in g.get("hooks") or [])
     others = []
     for g in groups:
-        if isinstance(g, dict) and "compact" in str(g.get("matcher", "")):
-            others += [str(h.get("command", "")) for h in g.get("hooks") or [] if isinstance(h, dict) and not is_ours(h)]
-    with open(HOOK_SRC, encoding="utf-8") as f:
+        # 压缩后只看 matcher 带 compact 的那几组；压缩前这个时机下的每一组都算
+        if isinstance(g, dict) and (spec["matcher"] is None or spec["matcher"] in str(g.get("matcher", ""))):
+            others += [str(h.get("command", "")) for h in g.get("hooks") or [] if isinstance(h, dict) and not is_ours(h, spec)]
+    with open(spec["src"], encoding="utf-8") as f:
         shipped = f.read()
     installed = None
     if os.path.isfile(target):
@@ -3058,26 +3069,38 @@ def hook_report(home):
             "disabled": obj.get("disableAllHooks") is True}
 
 
+def hook_status(home, spec):
+    r = hook_report(home, spec)
+    label = spec["label"]
+    if r["registered"] and r["file"]:
+        print("%s：已装上%s。" % (label, "，和这个 skill 带的版本一致" if r["current"] else "，但文件和这个 skill 带的版本不一样（重新 install 会换成新版）"))
+    elif r["registered"] or r["file"]:
+        print("%s：只装了一半（%s）。重新 install 或 remove 都能收拾干净。"
+              % (label, "settings.json 里登记了，文件不在" if r["registered"] else "文件在，settings.json 里没登记"))
+    else:
+        print("%s：没装。" % label)
+    for c in r["others"]:
+        print("已有别的%s：%s" % (spec["other"], clip(c, 120)))
+    if r["disabled"]:
+        print("注意：settings.json 里 disableAllHooks 是 true，所有 hook 现在都不跑。")
+    print("装或卸之前先备份这两个路径：%s %s" % (show(r["settings"], home), show(r["target"], home)))
+    print("\n%s原文（%s）：" % (label, spec["what"]))
+    body = re.split(r'print\(f?"""', r["shipped"], maxsplit=1)[-1].rsplit('""")', 1)[0]
+    print(body.replace("{p}", "{路径}"))
+
+
 def cmd_hook(args, home):
-    r = hook_report(home)
-    settings, target = r["settings"], r["target"]
     if args.action == "status":
-        if r["registered"] and r["file"]:
-            print("压缩后提醒：已装上%s。" % ("，和这个 skill 带的版本一致" if r["current"] else "，但文件和这个 skill 带的版本不一样（重新 install 会换成新版）"))
-        elif r["registered"] or r["file"]:
-            print("压缩后提醒：只装了一半（%s）。重新 install 或 remove 都能收拾干净。"
-                  % ("settings.json 里登记了，文件不在" if r["registered"] else "文件在，settings.json 里没登记"))
-        else:
-            print("压缩后提醒：没装。")
-        for c in r["others"]:
-            print("已有别的压缩后 hook：%s" % clip(c, 120))
-        if r["disabled"]:
-            print("注意：settings.json 里 disableAllHooks 是 true，所有 hook 现在都不跑。")
-        print("装或卸之前先备份这两个路径：%s %s" % (show(settings, home), show(target, home)))
-        print("\n提醒原文（每次压缩后放进模型上下文，{路径} 换成压缩前完整记录的位置）：")
-        body = r["shipped"].split('print(f"""', 1)[-1].rsplit('""")', 1)[0]
-        print(body.replace("{p}", "{路径}"))
+        # 不指定 --which 时两个都列；装和卸一次只动一个，不指定就是压缩后提醒
+        for i, w in enumerate([args.which] if args.which else ["after", "before"]):
+            if i:
+                print()
+            hook_status(home, HOOK_SPECS[w])
         return
+    spec = HOOK_SPECS[args.which or "after"]
+    event = spec["event"]
+    r = hook_report(home, spec)
+    settings, target = r["settings"], r["target"]
     if not args.backup:
         die("install 和 remove 要给 --backup。先 backup --paths %s %s" % (show(settings, home), show(target, home)))
     m = load_manifest(home, args.backup)
@@ -3087,28 +3110,31 @@ def cmd_hook(args, home):
         if entry_for(m, full)[1] is None:
             die("%s 不在备份 %s 里。先 backup --paths %s %s" % (show(full, home), m["id"], show(settings, home), show(target, home)))
     _bom, body, obj = read_settings(settings)
-    hooks, groups = session_start_groups(obj)
+    hooks, groups = event_groups(obj, event)
     if args.action == "install":
         new = copy.deepcopy(groups)
         if not r["registered"]:
-            new.append({"matcher": "compact", "hooks": [{"type": "command", "command": hook_command(target), "timeout": 5}]})
-        edits = [(["hooks", "SessionStart"], new, False)] if new != groups else []
+            group = {"hooks": [{"type": "command", "command": hook_command(target), "timeout": 5}]}
+            if spec["matcher"]:
+                group = dict({"matcher": spec["matcher"]}, **group)
+            new.append(group)
+        edits = [(["hooks", event], new, False)] if new != groups else []
     else:
         new = []
         for g in groups:
-            if isinstance(g, dict) and isinstance(g.get("hooks"), list) and any(is_ours(h) for h in g["hooks"]):
-                g = dict(g, hooks=[h for h in g["hooks"] if not is_ours(h)])
+            if isinstance(g, dict) and isinstance(g.get("hooks"), list) and any(is_ours(h, spec) for h in g["hooks"]):
+                g = dict(g, hooks=[h for h in g["hooks"] if not is_ours(h, spec)])
                 if not g["hooks"]:
                     continue
             new.append(g)
         if new == groups:
             edits = []
         elif new:
-            edits = [(["hooks", "SessionStart"], new, False)]
-        elif set(hooks) == {"SessionStart"}:
+            edits = [(["hooks", event], new, False)]
+        elif set(hooks) == {event}:
             edits = [(["hooks"], None, True)]
         else:
-            edits = [(["hooks", "SessionStart"], None, True)]
+            edits = [(["hooks", event], None, True)]
     tmp = body
     for path, value, delete in edits:   # 先在内存里试改一遍：排版对不上会在这里停下，文件一个都没动
         tmp, _old = json_edit(tmp, path, value, delete)
@@ -3120,16 +3146,17 @@ def cmd_hook(args, home):
             save_manifest(home, m)
             print("已写 %s" % show(target, home))
         if edits:
-            apply_edits(home, m["id"], settings, edits, summary="hooks.SessionStart 加了一条 compact")
+            apply_edits(home, m["id"], settings, edits,
+                        summary="hooks.%s 加了一条%s" % (event, " " + spec["matcher"] if spec["matcher"] else ""))
         if r["current"] and not edits:
             print("已经装好，没有变化。")
         for c in r["others"]:
-            print("注意：已有别的压缩后 hook，两段提醒会一起出现：%s" % clip(c, 120))
+            print("注意：已有别的%s，%s：%s" % (spec["other"], spec["clash"], clip(c, 120)))
         if r["disabled"]:
             print("注意：settings.json 里 disableAllHooks 是 true，装上了也不会跑。")
     else:
         if edits:
-            apply_edits(home, m["id"], settings, edits, summary="hooks.SessionStart 去掉压缩后提醒")
+            apply_edits(home, m["id"], settings, edits, summary="hooks.%s 去掉%s" % (event, spec["label"]))
         if os.path.isfile(target):
             os.remove(target)
             m = load_manifest(home, m["id"])
@@ -3573,8 +3600,10 @@ def main():
     cp = sub.add_parser("compare", help="两份 scan 的 json 对比开局用量")
     cp.add_argument("--before", required=True)
     cp.add_argument("--after", required=True)
-    hk = sub.add_parser("hook", help="压缩后提醒 hook：status 查看 / install 装上 / remove 卸掉")
+    hk = sub.add_parser("hook", help="压缩前后的两个 hook：status 查看 / install 装上 / remove 卸掉")
     hk.add_argument("action", choices=["status", "install", "remove"])
+    hk.add_argument("--which", choices=["after", "before"],
+                    help="after 是压缩后提醒，before 是压缩前要求。status 不给就两个都列，install 和 remove 不给就是 after")
     hk.add_argument("--backup", help="install 和 remove 要给")
     sub.add_parser("selftest", help="在临时目录里自检 backup → set → seal → rollback，不碰真实配置")
     args = ap.parse_args()
