@@ -181,5 +181,72 @@
       "what": "联网搜索工具的模式：disabled / cached / indexed / live。",
       "source": "https://developers.openai.com/codex/config-schema.json"
     }
+  ],
+  "verified_antigravity": "2026-11-26",
+  "_说明_antigravity": "antigravity 一节核对于 verified_antigravity 那天，对着 Antigravity 官方文档（antigravity.google/docs）和命令行 1.5.18 的隔离实验。where 说明这个键写在哪：env 是终端环境变量；mcp_config 是 ~/.gemini/config/mcp_config.json（项目里是 .agents/mcp_config.json）里每个 server 下面的键；skills.json 是 ~/.gemini/config/skills.json；rule 是规则文件开头的 frontmatter；limit 是改不了的上限，只供对照。scan 只报 env 那一类的当前值，其余的现状在报告的 Antigravity 一节里。",
+  "antigravity": [
+    {
+      "key": "AGY_CLI_AUTO_COMPACT_OVERRIDE",
+      "where": "env",
+      "default": "未设（Antigravity 按模型的上下文上限决定）",
+      "what": "命令行会话长到多大自动压缩。可以写 token 数（700000）、带 K 或 M 的简写（800K、0.5M）、或百分比（80%），不能超过模型的上下文上限。命令行 1.5.15 起对所有支持的模型生效，/context 和 /model 里能看到生效的值。只管命令行；桌面 app 的官方文档没有给出对应的设置。",
+      "source": "https://antigravity.google/docs/changelog（Antigravity CLI v1.5.15）"
+    },
+    {
+      "key": "mcpServers.<名字>.disabled",
+      "where": "mcp_config",
+      "default": "false",
+      "what": "true 时暂停这个 server 的连接，配置留着。停掉后它在发给模型的名单里只剩一个名字（1.5.18 实验）。",
+      "source": "https://antigravity.google/docs/mcp"
+    },
+    {
+      "key": "mcpServers.<名字>.tools.<工具名>.eager",
+      "where": "mcp_config",
+      "default": "未设（按需：只列名字，用到才读说明）",
+      "what": "true 时这个工具的完整说明每次请求都带着，名字是 mcp_<server>_<工具>。先过 enabledTools 和 disabledTools：被屏蔽的工具写了 eager 也不常驻。要省就删掉这个键，工具变回按需，功能不变，只是用之前多读一次说明文件。",
+      "source": "https://antigravity.google/docs/mcp#tool-loading-lazy-vs-eager"
+    },
+    {
+      "key": "mcpServers.<名字>.disabledTools",
+      "where": "mcp_config",
+      "default": "[]",
+      "what": "不给模型看的工具名单。按需的工具每个只占一个名字，屏蔽它们省得很少。",
+      "source": "https://antigravity.google/docs/mcp"
+    },
+    {
+      "key": "mcpServers.<名字>.enabledTools",
+      "where": "mcp_config",
+      "default": "未设（全部放行）",
+      "what": "只给模型看名单里的工具，其余都藏起来。",
+      "source": "https://antigravity.google/docs/mcp"
+    },
+    {
+      "key": "exclude",
+      "where": "skills.json",
+      "default": "未设",
+      "what": "要藏起来的 skill 的目录名列表（不支持通配符）。藏起来的 skill 不进发给模型的清单，文件不动。管得到全局的、~/.agents/skills 的、项目里的和内置的；管不到只有命令行读的 ~/.gemini/antigravity-cli/skills 和 ~/.gemini/skills。按目录名匹配，写 SKILL.md 里的 name 不生效（1.5.18 实验）。",
+      "source": "https://antigravity.google/docs/customization-discovery"
+    },
+    {
+      "key": "trigger",
+      "where": "rule",
+      "default": "必填",
+      "what": "rules/ 目录下每个规则文件开头必须声明：always_on 每次请求整份带着；model_decision 只给路径和一句描述，模型觉得相关才读；glob 碰到匹配的文件才带；manual 用户 @ 它才带（命令行不支持 @ 规则，在命令行里等于不加载）。没写或写了不认识的值（比如 alwaysOn），整个文件被丢掉、不报错。AGENTS.md、GEMINI.md 不用写，一律每次带着。",
+      "source": "https://antigravity.google/docs/rules"
+    },
+    {
+      "key": "每个规则文件 24,000 字节",
+      "where": "limit",
+      "default": "固定",
+      "what": "单个规则文件按展开之后的大小算（@[标签](路径) 换成那个文件去掉 frontmatter 之后的正文），超过 24,000 字节的部分被截掉，模型读不到。",
+      "source": "https://antigravity.google/docs/rules#size-limits-and-token-budgets"
+    },
+    {
+      "key": "常驻规则合计 20,000 token",
+      "where": "limit",
+      "default": "固定",
+      "what": "全局规则和 always_on 的规则合用 20,000 token 的预算，超了 Antigravity 自动把最大的几份降成只给路径和描述。",
+      "source": "https://antigravity.google/docs/rules#size-limits-and-token-budgets"
+    }
   ]
 }

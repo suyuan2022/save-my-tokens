@@ -2,7 +2,7 @@
 
 Claude Code 每次开新会话，第一次请求都要带上内置工具说明、系统提示、skill 清单、规则文件（`CLAUDE.md` / `AGENTS.md`）和 MCP 工具说明。装得多了，一句「你好」就是几万 token，每开一个新会话都要重新带上。
 
-save-my-tokens 是给 Claude Code 和 Codex 用的 skill。先跑本机脚本，量出这几万 token 怎么来的、装着的东西近 30 天用了几次；再由 agent 拿着报告逐项和你定去留，同意才改。
+save-my-tokens 是给 Claude Code、Codex 和 Antigravity（Google 的 Gemini 编程 agent，命令行叫 `agy`）用的 skill。先跑本机脚本，量出这几万 token 怎么来的、装着的东西近 30 天用了几次；再由 agent 拿着报告逐项和你定去留，同意才改。
 
 ## 快速开始
 
@@ -12,7 +12,7 @@ save-my-tokens 是给 Claude Code 和 Codex 用的 skill。先跑本机脚本，
 git clone https://github.com/suyuan2022/save-my-tokens ~/.claude/skills/save-my-tokens
 ```
 
-新开会话输入 `/save-my-tokens`（只能手动触发，平时不占上下文）。只想看报告或回滚，直接跑脚本：
+新开会话输入 `/save-my-tokens`（只能手动触发，平时不占上下文）。一次扫描会把这台机器上的 Claude Code、Codex、Antigravity 都查到，不用分别装。只用 Antigravity 的话，clone 到 `~/.gemini/config/skills/save-my-tokens`，在 Antigravity 里输入 `/save-my-tokens`。只想看报告或回滚，直接跑脚本：
 
 ```bash
 # 只读扫描（本机运行，不调模型）
@@ -33,6 +33,7 @@ python3 ~/.claude/skills/save-my-tokens/scripts/slim.py rollback
 - **规则与开关**：找规则文件重复（同会话一起加载、每次多带一遍，或 Claude Code 和 Codex 各读一份、不多花钱但可能走样），查超过上限 Codex 读不到的 `AGENTS.md`，以及写错或不生效的开关（类型不对、被环境变量覆盖、超范围、版本不支持）。
 - **逐个工具**：新开会话时发给模型的每个工具（内置的、你装的 MCP、桌面 app 自带的），说明是整份常驻还是只列名字按需加载、多大、近 30 天调了几次；延迟加载没生效时指出来。
 - **会话与子代理**：统计会话长度、缓存过期整段重算次数、子代理模型，用来定自动压缩窗口等设置；另列出主会话的模型把活派给了谁，哪几次派工大到像是把整件活转包了出去（子代理自己发了上百次请求）。
+- **Antigravity**：读它自己的会话日志和会话库，量出新开会话第一次请求带了多少 token（命令行、桌面 app 分开）、规则文件和 skill 清单各多大、哪些 MCP 工具整份常驻、会话实际长到多大才压缩。加载关系按 Antigravity 的规则算：同一层的 `AGENTS.md` 和 `GEMINI.md` 两份都加载，规则文件超过 24,000 字节的部分被截掉，`rules/` 下没写 `trigger` 的文件被丢掉；算出来的清单会和会话里实际加载的对一遍，对不上就写出来。不用的 skill 写进 `~/.gemini/config/skills.json` 的排除名单，skill 文件不动。
 - **官方审查**：查 `/doctor prompt-audit` 能不能用、卡在哪，及背后官方说明文件的本机位置。
 
 ### 2. agent 按 `SKILL.md` 逐项确认
@@ -132,10 +133,12 @@ python3 ~/.claude/skills/save-my-tokens/scripts/slim.py seal --backup <新的备
 ## 已知限制
 
 - 只在 macOS 上跑过。
-- 开局实测只有 Claude Code 有，Codex 没有。分项明细依赖较新版本 Claude Code 日志（核过 2.1.321、2.1.326），旧版只出总数。
-- Codex 的 skill 调用次数从「工具调用里读了某个 `SKILL.md`」推断，非官方计数。
+- 开局实测 Claude Code 和 Antigravity 有，Codex 没有。分项明细依赖较新版本 Claude Code 日志（核过 2.1.321、2.1.326），旧版只出总数。
+- Codex 和 Antigravity 的 skill 调用次数从「工具调用里读了某个 `SKILL.md`」推断，非官方计数。
+- Antigravity 的分项明细读的是它的会话库，这个格式官方没有公开，只在命令行 1.5.17–1.5.18 和同期的桌面 app 上核过；读不出时报告会写明，只给日志里的 token 总数。清单文件里的 `inherits`、项目里的 `skills.json`、所有的 `rules.json`，以及插件带进来的内容没有展开。两个压缩 hook 只有 Claude Code 能装。
 - 意思相同、措辞不同的重复规则脚本找不到，靠 agent 读文件判断。
-- 开关清单只收了核对过官方文档的二十几个键，键名和默认值随版本变，每条附出处和核对日期。
+- 报告会回显重复规则的原句。配置里键名是凭据的值（`API_KEY`、`*_TOKEN`、`headers` 下面的这些）、样子像凭据的片段（`KEY=值`、`Bearer …`、常见前缀的密钥）会遮掉；规则文件里换了写法裸写的密钥脚本认不出来。
+- 开关清单只收了核对过官方文档的三十几个键，键名和默认值随版本变，每条附出处和核对日期。
 - 同名 skill 在用户级和项目级各装一份时，日志分不出实际用哪份。
 - 桌面 app 走第三方网关时工具延迟加载被关掉的判断和改法，只在 Claude Code 2.1.330 上验证过；改法要写系统目录下的托管设置，需要管理员密码，命令由你自己跑。
 - 一次派工是你有意整件交出去的，还是模型自己转的，日志分不出，要 agent 问你。
@@ -147,6 +150,7 @@ SKILL.md                  给 agent 看的流程
 scripts/slim.py           扫描、备份、改单个键、屏蔽工具、回滚
 references/switches.json  开关清单：默认值、说明、官方出处、核对日期
 references/windows.md     在 Windows 上跑的注意事项
+references/antigravity.md Antigravity 的加载规则、能改的地方和命令，每条带出处
 references/compact-hook.md 压缩前要求和压缩后提醒的实测
 references/tool-search.md 工具延迟加载没生效时的判断和改法
 references/subagent-rules.md 派子代理规则的模板和填法

@@ -1,14 +1,14 @@
 ---
 name: save-my-tokens
-description: 给 Claude Code 和 Codex 的配置做一次体检：量出新开会话第一句话带了多少 token、花在哪，再按近 30 天实际用法和用户逐项商量清理什么、改哪几个设置，改前备份，可回滚。
+description: 给 Claude Code、Codex 和 Antigravity（Gemini 反重力）的配置做一次体检：量出新开会话第一句话带了多少 token、花在哪，再按近 30 天实际用法和用户逐项商量清理什么、改哪几个设置，改前备份，可回滚。
 disable-model-invocation: true
 ---
 
 # save-my-tokens
 
-给用户的 Claude Code / Codex 配置做体检。脚本读本机日志，量出每个新会话开局就带上的 token 由哪几块组成，以及装着的 skill、MCP、规则近 30 天用了几次；你拿这些证据和用户逐项定去留，他同意的才改，改前备份，可以回滚。
+给用户的 Claude Code / Codex / Antigravity 配置做体检。脚本读本机日志，量出每个新会话开局就带上的 token 由哪几块组成，以及装着的 skill、MCP、规则近 30 天用了几次；你拿这些证据和用户逐项定去留，他同意的才改，改前备份，可以回滚。
 
-脚本在本文件旁边：`python3 <本目录>/scripts/slim.py`，下面简写成 `slim`。只用 Python 标准库，参数用 `slim <子命令> -h` 查。用户的电脑是 Windows 时，先读 `references/windows.md`。
+脚本在本文件旁边：`python3 <本目录>/scripts/slim.py`，下面简写成 `slim`。只用 Python 标准库，参数用 `slim <子命令> -h` 查。用户的电脑是 Windows 时，先读 `references/windows.md`。报告里有 Antigravity（Gemini 反重力，命令行叫 agy）的章节时，先读 `references/antigravity.md`：Antigravity 的部分全部照那份做，下面各节写的是 Claude Code 和 Codex 的做法。
 
 ## 怎么跟用户说话
 
@@ -29,7 +29,7 @@ slim scan --json <系统临时目录>/save-my-tokens-scan.json
 
 ## 2. 先讲开局账单，定顺序
 
-报告的第一部分「开局」是 Claude Code 自己记在日志里的实测：新开一个会话，第一次请求带了多少 token，这一次请求里每一块多大。用五六行讲给用户：
+报告的第一部分「开局」是各个 agent 自己记在日志里的实测（Claude Code 和 Antigravity 各一段）：新开一个会话，第一次请求带了多少 token，这一次请求里每一块多大。用五六行讲给用户：
 
 1. 新开一个会话的第一次请求带了多少 token（中位数），最常用的那个目录是多少。
 2. 这一摞从大到小是什么，哪几块是固定的，哪几块能动。
@@ -186,7 +186,7 @@ slim scan --json <系统临时目录>/save-my-tokens-scan.json
 
 用户说不装，这一项就不进改动清单。以后要卸：新开一个备份（列 status 里对应那一行的两个路径），`slim hook remove --backup <新 ID>`（压缩前的加 `--which before`），再 `seal`。`rollback` 会把同一次备份里的其他改动一起退回，只卸 hook 时用 `remove`。
 
-只有 Claude Code 有这个时机；Codex 这里不装。
+只有 Claude Code 有这个时机；Codex 和 Antigravity 这里不装。
 
 ### 缓存：放着不动再回来
 
@@ -215,7 +215,7 @@ slim scan --json <系统临时目录>/save-my-tokens-scan.json
 
 - 「确定写错或不生效的」：逐条讲清楚错在哪，给出改法。
 - 「值得和用户过一遍的几个」（报告里带 `?` 的）：一个一个讲。每个都有一句现成的白话说明，照它讲，再说现在的值，问他要不要改。
-- 其余取舍项：报告只列事实。用户问到某个键，或者说了他想要的效果，再去 `references/switches.json` 查那个键管什么、默认是什么、出处在哪。清单开头的 `verified` 是核对日期，超过三个月时，先打开那个键的出处核对再回答。
+- 其余取舍项：报告只列事实。用户问到某个键，或者说了他想要的效果，再去 `references/switches.json` 查那个键管什么、默认是什么、出处在哪。清单开头的 `verified` 是核对日期（Antigravity 那一节看 `verified_antigravity`），超过三个月时，先打开那个键的出处核对再回答。
 
 ## 5. 执行
 
