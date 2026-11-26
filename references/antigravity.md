@@ -14,9 +14,10 @@
 - **开局 token**：会话日志 `~/.gemini/<数据目录>/brain/<会话>/.system_generated/logs/transcript.jsonl` 里第一条模型回复的 `input_tokens + cache_read_tokens`。这是 Antigravity 自己记的用量。`[实验]` agy 通过 ACP 报回来的是一轮里各次请求的合计（新输入、读缓存分开报），和日志里各次请求相加逐项相等；一轮只有一次请求时，它就是开局这个数。
 - **各部分的大小**：会话库 `conversations/<会话>.db` 里留着的最后一次请求的全文（Antigravity 只留最后一次）。这个格式官方没有公开，报告写「读不出各部分的大小」时，让用户在命令行里新开会话输入 `/context`，把结果贴过来。
 - **入口**：命令行、桌面 app、IDE 各有一个数据目录，报告按入口分开列，因为它们带的工具和 skill 不一样。
-- **skill 用了几次**：Antigravity 没有专门调 skill 的工具，用一个 skill 就是读它的 `SKILL.md`。报告数的是近 30 天有几个会话读过它，是推断。跟用户说的时候说「有几个会话读过」。次数按被读文件的真实路径归到具体那一份，同名的两份各算各的。
-- **自查**：每次扫描，脚本把自己算出来的规则文件清单、skill 清单，和每个入口最近一个会话里 Antigravity 实际发给模型的对一遍。对不上时报告里有一条「注意：……不一样」，那一块以实际发的为准，并把这条原样告诉用户。
-- **量不出来的会明说**：会话的第一条模型回复没记用量、会话在摘要库里查不到又分不清是不是子代理、会话库里有几段认不出来，报告各有一句说明，这些会话不进统计或标成「明细不完整」。转告用户，不要替它补数。
+- **skill 用了几次**：Antigravity 没有专门调 skill 的工具，用一个 skill 就是读它的 `SKILL.md`。报告数的是近 30 天有几个会话读过它，是推断。跟用户说的时候说「有几个会话读过」。次数按被读文件的真实路径归到具体那一份，同名的两份各算各的；读的是别处另一份同名文件不算。读的那个路径现在已经不在了、没法归属时，按目录名算到装着的那一份头上（多算只会让它留下）。
+- **自查**：每次扫描，脚本把自己算出来的规则文件清单、skill 清单，和每个入口最近一个会话里 Antigravity 实际发给模型的对一遍（那个会话的请求明细要读得全、工作目录还在；明细读得全但清单是空的也照对）。对不上时报告里有一条「注意：……不一样」，那一块以实际发的为准，并把这条原样告诉用户。
+- **量不出来的会明说**：会话的第一条模型回复没记用量、会话在摘要库里查不到又分不清是不是子代理、会话库里有几条记录认不出来，报告各有一句说明：前两种不进开局统计（它们读过的 skill、调过的 MCP 照算），第三种标成「明细不完整」并写明是哪几项的数偏小，`slim compare` 只跳过那几项。转告用户，不要替它补数。
+- **会话库正被写着时**：库旁边的 `-wal` 平时是空的 `[真机]`。里面有还没并入的改动时，脚本把库和 `-wal` 拷到系统临时目录读那份拷贝，读完删掉，原文件不碰；拷不成时报告会说这部分可能偏旧。
 - **模型**：桌面 app 的日志多数不记模型，报告用会话库里最后一次请求的模型补，并写明补了多少次。
 
 开局明细里某个 MCP 标着「来源未知」：脚本查过的 `mcp_config.json`（全局的，和工作目录往上各层的）里都没有它。常见的是开这个会话的程序自己带进来的（别的工具通过 `agy acp` 开的会话就是这样 `[真机]`），也可能是插件带的。先问用户这个会话是用什么开的，再决定去哪里设；这里只报大小。
@@ -27,6 +28,8 @@
 
 - 全局：`~/.gemini/AGENTS.md`、`~/.gemini/GEMINI.md`、`~/.gemini/config/AGENTS.md`、`~/.gemini/config/GEMINI.md`，存在几个加载几个。`[文档:rules]` `[实验]`
 - 项目：从工作目录往上到仓库根（有 `.git` 的那层），每一层的 `AGENTS.md`、`GEMINI.md`、`.agents/AGENTS.md`、`.agents/GEMINI.md`、`.agents/rules/*.md` 都加载。**同一层的 AGENTS.md 和 GEMINI.md 两份都加载**，内容相同就是重复带了两遍。`[文档:customization-discovery]` `[实验]`
+- 一个会话登记了几个工作目录的，每个目录都照上面这样算。`[真机]`（会话摘要库的 `workspace_uris` 是个列表）
+- 仓库内个人目录：仓库根的 `.gemini/config.json` 写了 `personal_customization_dir`（例：`people/{user}`，`{user}` 是当前用户名）时，那个目录根上的和它的 `.agents/` 里的 `AGENTS.md`、`.agents/rules/*.md`、`.agents/skills/` 也加载；别人的目录不加载；它的 `.agents/mcp_config.json` 在实验里没有加载。`[文档:customization-discovery]`（只写了 skill）`[实验]`
 - 这些位置的文件 Antigravity 不读：仓库根之上的目录、工作目录下面的子目录、`CLAUDE.md`、`rules/` 的嵌套子目录。`[实验]`
 - 工作目录不在任何仓库里时，只读工作目录这一层；把上级目录登记成 Antigravity 的项目也一样。`[文档:customization-discovery]` `[实验]`
 - `rules/` 目录下每个文件开头要写 `trigger`：`always_on` 每次整份带着；`model_decision` 只给模型一行路径加描述，相关时才读；`glob` 碰到匹配的文件才带；`manual` 用户 @ 它才带（命令行不支持 @ 规则，所以在命令行里它等于不加载）。没写或写错（比如 `alwaysOn`），整个文件被丢掉、不报错。`[文档:rules]` `[实验]`
@@ -38,7 +41,8 @@
 **Skill**
 
 - 模型每次请求看到一份清单：每个 skill 一行「名字（路径）：描述」。
-- 同名的 skill 只留一份。优先级从高到低：命令行专用的两个目录（只在命令行里）、项目里的、`~/.gemini/config/` 的（含它的清单文件点名的）、`~/.agents/skills` 的、内置的。`[文档:customization-discovery]` `[实验]` 报告里让位的那份标着「被同名的盖住」。
+- 同名的 skill 只留一份。优先级从高到低：命令行专用的两个目录（只在命令行里）、仓库内个人目录的、项目里的、`~/.gemini/config/` 的（含它的清单文件点名的）、`~/.agents/skills` 的、内置的。`[文档:customization-discovery]` `[实验]` 报告里让位的那份标着「被同名的盖住」。
+- 清单文件 `~/.gemini/config/skills.json`：`entries` 每项点一个目录，可以带 `include_only`（只留点名的，能点到嵌套的，例：`database/migrate-schema`）和 `exclude`（去掉点名的）；两样同时写时，被 `exclude` 点名的不加载。`inherits` 指向别的清单文件：那份清单的 `entries` 和顶层 `exclude` 都生效，`inherits` 这一项自己带的 `include_only` / `exclude` 只筛那份清单带进来的 skill。`[文档:customization-discovery]` `[实验]` `inherits` 指过去的文件读不了时，报告会提示，并且不给「可以直接排除」的 A 组。
 - 来源：`~/.gemini/config/skills`（全局）；`~/.agents/skills`（命令行 1.5.16 起也当全局读，和 `~/.gemini` 里的同名时让位）`[文档:changelog]` `[实验]`；`~/.gemini/antigravity-cli/skills` 和 `~/.gemini/skills`（只有命令行读，同名时它们优先）`[文档:customization-discovery]`；项目里各层的 `.agents/skills`；Antigravity 内置的。
 - **排除名单**：`~/.gemini/config/skills.json` 顶层的 `exclude`，写 skill 的**目录名**。写 `SKILL.md` 里的 `name` 不生效。`[实验]` 它管得到全局的、`~/.agents/skills` 的、项目里的和内置的 `[实验]`；管不到只有命令行读的那两个目录 `[文档:customization-discovery]` `[实验]`。排除只对 Antigravity 生效，skill 文件不动。
 - `SKILL.md` 开头写了 `disable-model-invocation: true` 的 skill 不进这份清单。`[实验]`（官方文档没写）所以 save-my-tokens 自己在 Antigravity 里不占位置；这种 skill 用户输入 `/名字` 仍然调得起来。`[实验]`
@@ -74,6 +78,7 @@
 - 报告里「排除名单里写的是它的 name……实际没排除掉」的：用户以为停了其实没停，告诉他，他同意后按目录名重新排除。
 - 只有命令行读的目录里的 skill，排除名单管不到，要停只能 `slim move` 搬走。
 - 项目里的 skill 也能写进排除名单；这份名单按目录名对所有项目生效，同名的都会藏掉，先和用户确认。
+- `--group` 是照着那份扫描改。扫描之后组里的 skill 搬过、改过内容，或者别处多了一个同目录名的 skill，脚本会拒绝并要求重新扫描：重新 `scan --json`，把新名单给用户确认之后再改。
 - 用户想要「只能手动调」：那是在这个 skill 的 `SKILL.md` 开头加 `disable-model-invocation: true`，改的是 skill 文件本身，Claude Code 也认这个字段，共用的 skill 两边一起变。讲清后由用户决定，改之前把那个文件加进 backup。
 
 **MCP**
@@ -113,8 +118,8 @@ slim rollback --backup ID
 
 碰到下面这些，告诉用户这一条脚本没有把握，以报告开局部分列出的实际加载为准：
 
-- 清单文件：全局 `skills.json` 的 `entries`（含每项的 `include_only`、`exclude`）脚本会展开 `[文档:customization-discovery]`（没做实验）；`inherits`、项目里的 `skills.json`、所有的 `rules.json` 没有展开，报告会提示有这些文件。
-- 凭据遮盖：配置里键名是凭据的值（`API_KEY`、`*_TOKEN`、`headers` 下面的这些）、样子像凭据的片段（`KEY=值`、`Bearer …`、常见前缀的密钥）在报告和命令输出里会遮掉。规则文件里换了写法裸写的密钥脚本认不出来；给用户看重复规则的原句之前，自己再看一眼。
+- 清单文件：全局 `skills.json`（`entries`、每项的筛选、`inherits`）脚本会展开；项目里的 `skills.json`、所有的 `rules.json` 没有展开，报告会提示有这些文件。
+- 凭据遮盖：配置里键名是凭据的值（`API_KEY`、`*_TOKEN`、`headers` 下面除了 `Accept-Language` 这类常见请求头以外的）在报告和命令输出里会遮掉。回显规则原句时另外按样子遮：`KEY=值`、`Bearer …`、常见前缀的密钥，以及 16 个字符以上、字母数字混着的词（会连带遮掉一些带数字的长名字，旁边有文件名和行号，可以去原文看）。遮不掉的：用大白话写在规则里、又短于 16 个字符或者不含数字的口令。给用户看重复规则的原句之前，自己再看一眼。
 - 插件带进来的 skill、规则和 MCP：归插件管，脚本不动。
 - SessionStart 的 hook 放进来的内容以一条系统消息进会话 `[实验]`：它算在开局 token 的总数里，但不在「各部分的大小」那张表里，脚本没有单独量它。PreInvocation 的 hook 没试过。
 - 桌面 app 读不读 `~/.agents/skills`、IDE 入口的行为：没有样本。

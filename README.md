@@ -135,9 +135,9 @@ python3 ~/.claude/skills/save-my-tokens/scripts/slim.py seal --backup <新的备
 - 只在 macOS 上跑过。
 - 开局实测 Claude Code 和 Antigravity 有，Codex 没有。分项明细依赖较新版本 Claude Code 日志（核过 2.1.321、2.1.326），旧版只出总数。
 - Codex 和 Antigravity 的 skill 调用次数从「工具调用里读了某个 `SKILL.md`」推断，非官方计数。
-- Antigravity 的分项明细读的是它的会话库，这个格式官方没有公开，只在命令行 1.5.17–1.5.18 和同期的桌面 app 上核过；读不出时报告会写明，只给日志里的 token 总数。清单文件里的 `inherits`、项目里的 `skills.json`、所有的 `rules.json`，以及插件带进来的内容没有展开。两个压缩 hook 只有 Claude Code 能装。
+- Antigravity 的分项明细读的是它的会话库，这个格式官方没有公开，只在命令行 1.5.17–1.5.18 和同期的桌面 app 上核过；读不出时报告会写明，只给日志里的 token 总数。项目里的 `skills.json`、所有的 `rules.json`，以及插件带进来的内容没有展开（全局 `skills.json` 的 `entries` 和 `inherits` 会展开）。两个压缩 hook 只有 Claude Code 能装。
 - 意思相同、措辞不同的重复规则脚本找不到，靠 agent 读文件判断。
-- 报告会回显重复规则的原句。配置里键名是凭据的值（`API_KEY`、`*_TOKEN`、`headers` 下面的这些）、样子像凭据的片段（`KEY=值`、`Bearer …`、常见前缀的密钥）会遮掉；规则文件里换了写法裸写的密钥脚本认不出来。
+- 报告会回显重复规则的原句。配置里键名是凭据的值（`API_KEY`、`*_TOKEN`、自定义请求头这些）、样子像凭据的片段（`KEY=值`、`Bearer …`、常见前缀的密钥、16 个字符以上字母数字混着的词）会遮掉；用大白话写在规则里、又短又不含数字的口令脚本认不出来。
 - 开关清单只收了核对过官方文档的三十几个键，键名和默认值随版本变，每条附出处和核对日期。
 - 同名 skill 在用户级和项目级各装一份时，日志分不出实际用哪份。
 - 桌面 app 走第三方网关时工具延迟加载被关掉的判断和改法，只在 Claude Code 2.1.330 上验证过；改法要写系统目录下的托管设置，需要管理员密码，命令由你自己跑。

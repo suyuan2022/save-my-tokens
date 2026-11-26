@@ -151,13 +151,16 @@ NOT_SECRET_KEY_RE = re.compile(r"(?i)(max|min|limit|(?<!ac)count|budget|date|tim
 ONE_STRING_RE = re.compile(r"^[A-Za-z0-9._~+=:@%-]+$")          # 一整串，没有空格和斜杠：不是句子，也不是路径
 FILE_LIKE_RE = re.compile(r"(?i)\.(md|json|jsonl|txt|toml|ya?ml|py|sh|js|ts|db|log|html?)$")
 DATE_LIKE_RE = re.compile(r"^\d{4}-\d\d-\d\d")
+# headers 下面的值默认当凭据（自定义的请求头多半是密钥）；这些常见的头不是
+PLAIN_HEADER_RE = re.compile(r"(?i)^(accept(-.*)?|content-.*|user-agent|cache-control|connection|host|origin|referer|pragma|"
+                             r"mcp-protocol-version|x-request-id|x-client-(name|version)|x-forwarded-.*)$")
 
 
 def secret_key_tier(k):
     """一个键名有多像凭据：2 明确是，1 沾边，0 不是。"""
     if not isinstance(k, str):
         return 0
-    if k == "headers" or STRICT_SECRET_KEY_RE.search(k):
+    if STRICT_SECRET_KEY_RE.search(k):
         return 2 if FIELD_NAME_RE.match(k) else 0
     if SECRET_RE.search(k) and FIELD_NAME_RE.match(k) and not NOT_SECRET_KEY_RE.search(k):
         return 1
@@ -168,6 +171,10 @@ def note_secrets(v, tier=0):
     """走一遍配置，把凭据值记进 KNOWN_SECRETS（tier 见 secret_key_tier，子项沿用上层最高的一档）。"""
     if isinstance(v, dict):
         for k, x in v.items():
+            if k == "headers" and isinstance(x, dict):
+                for hk, hv in x.items():
+                    note_secrets(hv, 0 if isinstance(hk, str) and PLAIN_HEADER_RE.match(hk) else 2)
+                continue
             note_secrets(x, max(tier, secret_key_tier(k)))
     elif isinstance(v, list):
         for x in v:
@@ -175,7 +182,8 @@ def note_secrets(v, tier=0):
     elif tier and isinstance(v, str):
         m = re.match(r"(?i)(?:bearer|basic)\s+(\S{8,})$", v)
         core = m.group(1) if m else v
-        if (not ONE_STRING_RE.match(core) or PLAIN_VALUE_RE.match(core) or FILE_LIKE_RE.search(core)
+        plain = PLAIN_VALUE_RE.match(core) and not (tier == 2 and re.match(r"^\d{8,}$", core))    # 明确是凭据的键下面，8 位以上的纯数字也算
+        if (not ONE_STRING_RE.match(core) or plain or FILE_LIKE_RE.search(core)
                 or DATE_LIKE_RE.match(core)):
             return
         if tier == 2 and len(core) >= 8:
@@ -193,6 +201,15 @@ def hide_known(text, as_json=False):
     return text
 
 
+TOKENISH_RE = re.compile(r"(?<![A-Za-z0-9_/.\-~])[A-Za-z0-9][A-Za-z0-9_+=\-]{15,}(?![A-Za-z0-9_/\-]|\.[A-Za-z0-9])")
+
+
+def tokenish(w):
+    """自然语言里裸写的一个词像不像密钥：16 个字符以上、字母和数字混着。带双下划线的（工具名）、路径和文件名里的不算。
+    宁可多遮：被遮的是报告里回显的一句规则原文，旁边有文件名，用户可以自己去看。"""
+    return bool(re.search(r"\d", w) and re.search(r"[A-Za-z]", w) and "__" not in w and not DATE_LIKE_RE.match(w))
+
+
 def scrub(text):
     """回显规则文件、描述这类自由文本之前用：见过的凭据值遮掉，样子像凭据的（key=值、Bearer、常见前缀的密钥）也遮掉。"""
     if not isinstance(text, str) or not text:
@@ -200,7 +217,8 @@ def scrub(text):
     text = hide_known(text)
     text = SECRET_SHAPES[0].sub(lambda m: m.group(1) + " <已遮掉>", text)
     text = SECRET_SHAPES[1].sub(lambda m: m.group(1) + m.group(2) + "<已遮掉>", text)
-    return SECRET_SHAPES[2].sub("<已遮掉>", text)
+    text = SECRET_SHAPES[2].sub("<已遮掉>", text)
+    return TOKENISH_RE.sub(lambda m: "<已遮掉>" if tokenish(m.group(0)) else m.group(0), text)
 
 
 def mask_secrets(v, hot=False):
@@ -393,6 +411,7 @@ def list_skills(base, scope, only=None):
             "desc": scrub(fm.get("description", "")[:200]),
             "manual_only": fm.get("disable-model-invocation", "").lower() == "true",
             "installed_ts": born,
+            "md_sha": sha256_file(md),
         })
     return items
 
@@ -919,6 +938,47 @@ def agy_sqlite(path):
     return sqlite3.connect("file:%s?mode=ro&immutable=1" % urllib.parse.quote(path), uri=True)
 
 
+class agy_db(object):
+    """读一个 Antigravity 的 SQLite 库：`with agy_db(path) as con`。
+    旁边的 -wal 是空的（实机上平时都是）就直接只读打开。-wal 里有还没并进主库的改动时，只读主库会读到旧的，
+    所以把主库和 -wal 拷到系统临时目录里读那份拷贝（原库和它的旁文件都不碰），读完删掉；拷不成就退回只读主库，stale 记成 True。"""
+
+    def __init__(self, path):
+        self.path, self.tmp, self.con, self.stale, self.merged = path, None, None, False, False
+
+    def __enter__(self):
+        try:
+            pending = os.path.getsize(self.path + "-wal") > 0
+        except OSError:
+            pending = False
+        if pending:
+            import sqlite3
+            import tempfile
+            try:
+                self.tmp = tempfile.mkdtemp(prefix="save-my-tokens-")
+                dst = os.path.join(self.tmp, "copy.db")
+                shutil.copyfile(self.path, dst)
+                shutil.copyfile(self.path + "-wal", dst + "-wal")
+                self.con = sqlite3.connect(dst)
+                self.con.execute("select count(*) from sqlite_master").fetchone()
+                self.merged = True
+            except Exception:
+                if self.con is not None:
+                    self.con.close()
+                self.con, self.stale = None, True
+        if self.con is None:
+            self.con = agy_sqlite(self.path)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.con.close()
+        finally:
+            if self.tmp:
+                shutil.rmtree(self.tmp, ignore_errors=True)
+        return False
+
+
 def pb_fields(b):
     """把一段 protobuf 拆成 [(字段号, 线型, 值)]。拆不动返回 None。只解到这里用得着的程度。"""
     out, i, n = [], 0, len(b)
@@ -1013,12 +1073,11 @@ def agy_mcp_listing(text):
 def agy_shape(db):
     """会话库里留着的那一次请求（Antigravity 只留每个会话最后一次请求的全文）：系统提示每一段多大、
     加载了哪些规则和 skill、带了哪些工具说明。只量大小、记名字和路径，内容不留。认不出格式返回 None。"""
+    stale = False
     try:
-        con = agy_sqlite(db)
-        try:
-            row = con.execute("select data from gen_metadata order by idx desc limit 1").fetchone()
-        finally:
-            con.close()
+        with agy_db(db) as h:
+            row = h.con.execute("select data from gen_metadata order by idx desc limit 1").fetchone()
+            stale = h.stale
     except Exception:       # 库不存在、表不存在、这个 Python 没带 sqlite3：都当作量不出来
         return None
     if not row or not isinstance(row[0], (bytes, bytearray)):
@@ -1027,7 +1086,7 @@ def agy_shape(db):
     inner = pb_fields(req) if req else None
     if not inner:
         return None
-    system, sections, decls, bad = None, [], [], 0
+    system, sections, decls, bad, bad_tools = None, [], [], 0, 0
     for f, wt, v in inner:
         if wt != 2:
             continue
@@ -1045,7 +1104,7 @@ def agy_shape(db):
             if name and re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", name):
                 decls.append([name, len(pb_text(d.get(2, b"")) or "") + len(pb_text(d.get(3, b"")) or "") + len(name)])
             else:
-                bad += 1
+                bad_tools += 1      # 一条工具声明认不出来：工具那两项的大小就不全，和系统提示的分段无关
     # 系统提示全文里也有每一段：分段记录缺了或坏了的，从全文里补回来；补不回来就标成「明细不完整」，不把缺的当成 0
     have = set(n_ for n_, _t in sections)
     for n_, t in (agy_split_tags(system) if system else []):
@@ -1076,7 +1135,11 @@ def agy_shape(db):
         tools["items"].append([name, size, srv])
     parts["builtin_tools"] = tools["builtin"]["chars"]
     parts["mcp_tools"] = sum(v["chars"] for v in tools["mcp"].values())
-    return {"parts": parts, "files": files, "pointers": pointers, "tools": tools, "partial": bad > 0,
+    # 哪几项的数不可靠：分段记录坏了又没能从全文补回来的，说不清缺的是哪一段，系统提示那几项都算；工具声明坏了只算工具两项
+    partial_parts = sorted((["rules", "skills", "mcp_list", "agents", "system"] if bad > 0 else [])
+                           + (["builtin_tools", "mcp_tools"] if bad_tools else []))
+    return {"parts": parts, "files": files, "pointers": pointers, "tools": tools, "partial": bool(partial_parts),
+            "partial_parts": partial_parts, "stale": stale,
             "skill_count": len(listed), "skill_paths": [p for _n, p in listed], "skill_names": [n_ for n_, _p in listed],
             "lazy": {srv: v["lazy"] for srv, v in servers.items()}, "servers": sorted(servers),
             "sections": [[n_, len(t)] for n_, t in sections]}
@@ -1085,11 +1148,8 @@ def agy_shape(db):
 def agy_db_model(db):
     """会话库最后一次请求用的模型（例：gemini-4-neon-high）。桌面 app 的日志不记模型，用它补。读不出返回 None。"""
     try:
-        con = agy_sqlite(db)
-        try:
-            row = con.execute("select data from gen_metadata order by idx desc limit 1").fetchone()
-        finally:
-            con.close()
+        with agy_db(db) as h:
+            row = h.con.execute("select data from gen_metadata order by idx desc limit 1").fetchone()
     except Exception:
         return None
     if not row or not isinstance(row[0], (bytes, bytearray)):
@@ -1111,19 +1171,21 @@ def agy_arg(v):
 
 def agy_summaries(base):
     """会话摘要库：每个会话在哪个目录开的、是不是别的会话派出来的子代理、标题。
-    返回 (每个会话的信息, 库里有没有「父会话」这一列)。读不了返回 ({}, False)。"""
+    返回 (每个会话的信息, 库里有没有「父会话」这一列, 读到的是不是可能偏旧)。读不了返回 ({}, False, False)。
+    「可能偏旧」：库旁边的 -wal 里有没并入的改动，又没能拷出来读。这时库里说「没有父会话」不能全信。"""
     out = {}
     p = os.path.join(base, "conversation_summaries.db")
     if not os.path.isfile(p):
-        return out, False
+        return out, False, False
+    stale = False
     try:
         import urllib.parse
-        con = agy_sqlite(p)
-        try:
+        with agy_db(p) as h:
+            con, stale = h.con, h.stale
             cols = set(r[1] for r in con.execute("pragma table_info(conversation_summaries)"))
             want = [c for c in ("conversation_id", "workspace_uris", "parent_conversation_id", "agent_name", "title") if c in cols]
             if "conversation_id" not in want:
-                return out, False
+                return out, False, stale
             for row in con.execute("select %s from conversation_summaries" % ",".join(want)):
                 d = dict(zip(want, row))
                 cwds = []
@@ -1135,11 +1197,25 @@ def agy_summaries(base):
                     pass
                 out[d["conversation_id"]] = {"cwd": cwds[0] if cwds else "", "cwds": cwds, "parent": d.get("parent_conversation_id") or "",
                                              "agent": d.get("agent_name") or "", "title": d.get("title") or ""}
-        finally:
-            con.close()
     except Exception:
-        return {}, False
-    return out, "parent_conversation_id" in cols
+        return {}, False, False
+    return out, "parent_conversation_id" in cols, stale
+
+
+AGY_TS_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?([+-]\d\d):?(\d\d)$")
+
+
+def agy_ts(v):
+    """日志里的时间统一成 UTC 的前 19 位（2026-11-18T12:00:00）。实机写的都是 Z 结尾；带时区偏移的换算过来，不按字面比。"""
+    t = str(v or "")
+    m = AGY_TS_RE.match(t)
+    if not m or (m.group(2) in ("+00", "-00") and m.group(3) == "00"):
+        return t[:19]
+    try:
+        off = datetime.timedelta(hours=int(m.group(2)), minutes=int(m.group(2)[0] + m.group(3)))
+        return (datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S") - off).strftime("%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return t[:19]
 
 
 AGY_USER_INPUT_RE = re.compile(rb'"type":\s*"USER_INPUT"')
@@ -1153,12 +1229,59 @@ def scan_agy_logs(home, cutoff):
          "bins": Counter(), "bin_tokens": Counter(), "peaks": [], "rewrites": {}, "checkpoints": [],
          "skill_reads": {}, "skill_read_paths": {}, "mcp": {}, "raw_mcp_tools": {}, "agents": {}, "agent_model": Counter(),
          "tool_calls": Counter(), "sub_runs": [], "no_db": 0, "model_from_db": 0, "model_unknown": 0, "wal_pending": 0,
-         "kind_unknown": 0, "start_no_usage": 0, "partial_shape": 0}
+         "kind_unknown": 0, "start_no_usage": 0, "partial_shape": 0, "skill_reads_gone": {}, "summaries_stale": 0, "wal_merged": 0}
+
+    def note_tools(rec, ts, cwd, read_here):
+        """一条模型回复里的工具调用：读了哪个 skill、调了哪个 MCP、派了什么子代理。这些是这条日志自己能证明的事，
+        和这个会话是谁开的无关，所以身份不明的会话也照记。"""
+        for tc in rec.get("tool_calls") or []:
+            if not isinstance(tc, dict) or not isinstance(tc.get("name"), str):
+                continue
+            name = tc["name"]
+            args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+            r["tool_calls"][name] += 1
+            if name == "read_file":
+                # Antigravity 没有专门的 Skill 工具：用一个 skill 就是读它的 SKILL.md。同一个会话读几段只算一次。
+                # 按文件的真实路径记（同名的 skill、放在自定义目录的 skill 才分得清）；另按目录名记一份给别的 agent 的 skill 对账用；
+                # 那个路径现在已经不在了的（临时目录、搬走了），没法按路径归属，再按目录名单记一份
+                path_arg = str(agy_arg(args.get("Path")) or "")
+                if path_arg.startswith("file://"):
+                    path_arg = path_arg[7:]
+                if os.path.basename(path_arg) == "SKILL.md" and os.path.isabs(path_arg):
+                    key = os.path.realpath(os.path.dirname(path_arg))
+                    if key not in read_here:
+                        read_here.add(key)
+                        bump(r["skill_read_paths"], key, ts, cwd)
+                    sk = os.path.basename(os.path.dirname(path_arg))
+                    if ("name", sk) not in read_here:
+                        read_here.add(("name", sk))
+                        bump(r["skill_reads"], sk, ts, cwd)
+                    if not os.path.exists(path_arg) and ("gone", sk) not in read_here:
+                        read_here.add(("gone", sk))
+                        bump(r["skill_reads_gone"], sk, ts, cwd)
+            elif name == "call_mcp_tool":
+                srv, tool = str(agy_arg(args.get("ServerName")) or "?"), str(agy_arg(args.get("ToolName")) or "?")
+                u = r["mcp"].setdefault(srv, {"n": 0, "last": "", "tools": Counter()})
+                u["n"] += 1
+                u["tools"][tool] += 1
+                u["last"] = max(u["last"], ts)
+            elif name.startswith("mcp_"):
+                u = r["raw_mcp_tools"].setdefault(name, {"n": 0, "last": ""})    # 常驻（eager）的 MCP 工具，归到哪个 server 等读了配置再定
+                u["n"] += 1
+                u["last"] = max(u["last"], ts)
+            elif name == "invoke_subagent":
+                r["agent_model"][str(agy_arg(args.get("Model")) or "")] += 1
+                kind = str(agy_arg(args.get("TypeName")) or "")
+                if kind:
+                    bump(r["agents"], kind, ts, cwd)
+
     for app in agy_app_dirs(home):
         base = os.path.join(g, app)
         r["present"] = True
         r["dirs"].append(app)
-        meta, has_parent_col = agy_summaries(base)
+        meta, has_parent_col, meta_stale = agy_summaries(base)
+        if meta_stale:
+            r["summaries_stale"] += 1
         for cid in sorted(os.listdir(os.path.join(base, "brain"))):
             p = os.path.join(base, "brain", cid, ".system_generated", "logs", "transcript.jsonl")
             try:
@@ -1175,7 +1298,8 @@ def scan_agy_logs(home, cutoff):
             r["bytes"] += st.st_size
             # 这个会话是用户自己开的还是别的会话派出来的子代理：摘要库里有这一行、也有「父会话」这一列时听它的；
             # 查不到时看日志：用户开的会话开头有一条用户输入，子代理的没有（实机 126 个会话无一例外）。两头都没有就算身份不明，单列。
-            role = ("sub" if row["parent"] else "main") if (row is not None and has_parent_col) else None
+            # 摘要库可能偏旧时，「有父会话」照信，「没有父会话」不全信，改看日志
+            role = ("sub" if row["parent"] else (None if meta_stale else "main")) if (row is not None and has_parent_col) else None
             has_user = False
             prev_ctx, prev_ts, model, peak, first, reqs, read_here = None, None, "?", 0, None, 0, set()
             pr_seen, no_usage_first, in_window = 0, False, False
@@ -1203,10 +1327,14 @@ def scan_agy_logs(home, cutoff):
                     if role is None:
                         role = "main" if has_user else "unknown"
                     if role == "unknown":
-                        in_window = in_window or str(rec.get("created_at") or "")[:19] >= cutoff_iso
+                        ts = agy_ts(rec.get("created_at"))
+                        if not ts or ts >= cutoff_iso:
+                            in_window = True
+                            if rec["type"] == "PLANNER_RESPONSE":
+                                note_tools(rec, ts, cwd, read_here)
                         continue
                     is_sub = role == "sub"
-                    ts = str(rec.get("created_at") or "")[:19]
+                    ts = agy_ts(rec.get("created_at"))
                     if ts:
                         if ts < cutoff_iso:
                             r["older_evidence"] = True
@@ -1257,49 +1385,15 @@ def scan_agy_logs(home, cutoff):
                         prev_ctx, prev_ts = ctx, ts or prev_ts
                     if not inwin:
                         continue
-                    for tc in rec.get("tool_calls") or []:
-                        if not isinstance(tc, dict) or not isinstance(tc.get("name"), str):
-                            continue
-                        name = tc["name"]
-                        args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
-                        r["tool_calls"][name] += 1
-                        if name == "read_file":
-                            # Antigravity 没有专门的 Skill 工具：用一个 skill 就是读它的 SKILL.md。同一个会话读几段只算一次。
-                            # 按文件的真实路径记（同名的 skill、放在自定义目录的 skill 才分得清），另按目录名记一份给别的 agent 的 skill 对账用
-                            path_arg = str(agy_arg(args.get("Path")) or "")
-                            if path_arg.startswith("file://"):
-                                path_arg = path_arg[7:]
-                            if os.path.basename(path_arg) == "SKILL.md" and os.path.isabs(path_arg):
-                                key = os.path.realpath(os.path.dirname(path_arg))
-                                if key not in read_here:
-                                    read_here.add(key)
-                                    bump(r["skill_read_paths"], key, ts, cwd)
-                                sk = os.path.basename(os.path.dirname(path_arg))
-                                if ("name", sk) not in read_here:
-                                    read_here.add(("name", sk))
-                                    bump(r["skill_reads"], sk, ts, cwd)
-                        elif name == "call_mcp_tool":
-                            srv, tool = str(agy_arg(args.get("ServerName")) or "?"), str(agy_arg(args.get("ToolName")) or "?")
-                            u = r["mcp"].setdefault(srv, {"n": 0, "last": "", "tools": Counter()})
-                            u["n"] += 1
-                            u["tools"][tool] += 1
-                            u["last"] = max(u["last"], ts)
-                        elif name.startswith("mcp_"):
-                            u = r["raw_mcp_tools"].setdefault(name, {"n": 0, "last": ""})    # 常驻（eager）的 MCP 工具，归到哪个 server 等读了配置再定
-                            u["n"] += 1
-                            u["last"] = max(u["last"], ts)
-                        elif name == "invoke_subagent":
-                            r["agent_model"][str(agy_arg(args.get("Model")) or "")] += 1
-                            kind = str(agy_arg(args.get("TypeName")) or "")
-                            if kind:
-                                bump(r["agents"], kind, ts, cwd)
+                    note_tools(rec, ts, cwd, read_here)
             if role == "unknown":
                 if in_window:
                     r["kind_unknown"] += 1
                 continue
             is_sub = role == "sub"
-            if cwd and not is_sub and role == "main":
-                r["cwds"][cwd] += 1
+            if not is_sub and role == "main":
+                for c_ in info["cwds"] or ([cwd] if cwd else []):       # 一个会话可以登记几个工作目录，每个都要看它的规则和 skill
+                    r["cwds"][c_] += 1
             if no_usage_first:
                 r["start_no_usage"] += 1
             db = os.path.join(base, "conversations", cid + ".db")
@@ -1335,17 +1429,14 @@ def scan_agy_logs(home, cutoff):
                 else:
                     if shape.get("partial"):
                         r["partial_shape"] += 1
-                    try:
-                        # 只读方式打开读不到 -wal 里还没并入主库的改动。实机上 -wal 都是 0 字节；不是的话明说可能偏旧
-                        if os.path.getsize(db + "-wal") > 0:
-                            r["wal_pending"] += 1
-                    except OSError:
-                        pass
+                    if shape.get("stale"):
+                        r["wal_pending"] += 1       # -wal 里有没并入的改动、又没能拷出来读：明细可能不是最新一次请求的
                 first.update({"parts": (shape or {}).get("parts") or {}, "files": (shape or {}).get("files") or [],
                               "tools": (shape or {}).get("tools"), "skill_count": (shape or {}).get("skill_count"),
                               "skill_paths": (shape or {}).get("skill_paths") or [], "pointers": (shape or {}).get("pointers") or [],
                               "lazy": (shape or {}).get("lazy") or {}, "servers": (shape or {}).get("servers") or [],
-                              "partial": bool((shape or {}).get("partial")),
+                              "partial": bool((shape or {}).get("partial")), "partial_parts": (shape or {}).get("partial_parts") or [],
+                              "has_shape": shape is not None,
                               "deferred_n": sum(len(v) for v in ((shape or {}).get("lazy") or {}).values()),
                               "deferred_names": []})
                 r["starts"].append(first)
@@ -1424,17 +1515,37 @@ def agy_dirs(cwd, home):
         d = up
 
 
+def agy_personal_dir(root):
+    """仓库根的 .gemini/config.json 里 personal_customization_dir 指的「仓库内个人目录」（{user} 换成当前用户名）。没设、目录不在返回 None。
+    官方文档写了 skill；1.5.18 实验：这个目录里的 skill、它根上的和 .agents 里的 AGENTS.md、.agents/rules 都加载，
+    同名 skill 它比项目的、全局的都优先；它的 .agents/mcp_config.json 在实验里没有加载。"""
+    d, _e = load_json_file(os.path.join(root, ".gemini", "config.json"))
+    v = d.get("personal_customization_dir") if isinstance(d, dict) else None
+    if not isinstance(v, str) or not v.strip():
+        return None
+    user = os.environ.get("USER") or os.environ.get("USERNAME") or ""
+    if not user:
+        try:
+            import getpass
+            user = getpass.getuser()
+        except Exception:
+            user = ""
+    pd = os.path.normpath(os.path.join(root, v.replace("{user}", user)))
+    return pd if os.path.isdir(pd) and os.path.realpath(pd) != os.path.realpath(root) else None
+
+
 def agy_chain(cwd, home):
     files, pointers, dropped = [], [], []
     dirs, in_repo = agy_dirs(cwd, home)
-    for d in dirs:
+    pd = agy_personal_dir(dirs[-1]) if in_repo else None
+    for d in dirs + ([pd] if pd else []):
         for sub in ("",) + AGY_DOT:
             for n in AGY_RULE_NAMES:            # 同一层的 AGENTS.md 和 GEMINI.md 都加载，不是二选一
                 p = os.path.join(d, sub, n) if sub else os.path.join(d, n)
-                if os.path.isfile(p):
+                if os.path.isfile(p) and p not in files:
                     files.append(p)
         a, b, c = agy_rules_at(d, home)
-        files += a
+        files += [x for x in a if x not in files]
         pointers += b
         dropped += c
     for f in list(files):
@@ -1442,31 +1553,89 @@ def agy_chain(cwd, home):
     return files, pointers, dropped, in_repo
 
 
-def agy_manifest(path):
-    """skills.json：entries 是额外要加载的目录（每项可以带 include_only / exclude），顶层 exclude 是要藏起来的 skill 的目录名。
-    返回 (entries, exclude, 错误, 有没有脚本不展开的 inherits)。"""
+def agy_skill_dirs(cwd, home):
+    """一个工作目录里 Antigravity 会读的项目级 skill 目录，按同名时的优先级从高到低：[(目录, scope)]。
+    仓库设了个人目录的，个人目录排最前（官方文档的优先级 + 实验）。家目录的 .agents 不算项目的（它是全局的 ~/.agents/skills）。"""
+    out = []
+    dirs, in_repo = agy_dirs(cwd, home)
+    pd = agy_personal_dir(dirs[-1]) if in_repo else None
+    if pd:
+        out += [(os.path.join(pd, x, "skills"), "personal:" + dirs[-1]) for x in AGY_DOT]
+    for d in dirs:
+        out += [(os.path.join(d, x, "skills"), "project:" + d) for x in AGY_DOT if not (d == home and x == ".agents")]
+    return out
+
+
+def agy_ws(scope):
+    """这个 skill 是跟着工作目录走的（项目里的、仓库内个人目录里的），不是用户级的。"""
+    return scope.split(":")[0] in ("project", "personal")
+
+
+def agy_manifest(path, depth=0, seen=None):
+    """skills.json：entries 是额外要加载的目录（每项可以带 include_only / exclude），顶层 exclude 是要藏起来的 skill 的目录名，
+    inherits 指向别的清单文件（每项也可以带 include_only / exclude，只筛那份清单带进来的东西）。
+    返回 (entries, exclude, 错误, 读不了的 inherits)。entries 里的 path 已经是绝对路径；inherits 进来的清单的顶层 exclude 也并进 exclude
+    （1.5.18 实验：inherits 过来的清单的 entries 和顶层 exclude 都生效）。"""
+    seen = seen if seen is not None else set()
+    seen.add(os.path.realpath(path))
     d, err = load_json_file(path)
     if not isinstance(d, dict):
-        return [], [], (None if err == "absent" else err or "顶层不是对象"), False
+        return [], [], (None if err == "absent" else err or "顶层不是对象"), []
     strs = lambda v: [x for x in v or [] if isinstance(x, str)] if isinstance(v, list) else []
-    entries = [{"path": e["path"], "include_only": strs(e.get("include_only")) if "include_only" in e else None, "exclude": strs(e.get("exclude"))}
+    # 相对路径从哪算：清单在 .agents/ 里的，从装着 .agents 的那个目录算；否则从清单所在的目录算（个人清单就是 ~/.gemini/config）
+    here = os.path.dirname(os.path.abspath(path))
+    base = os.path.dirname(here) if os.path.basename(here) in AGY_DOT else here
+    entries = [{"path": e["path"] if os.path.isabs(e["path"]) else os.path.join(base, e["path"]),
+                "include_only": strs(e.get("include_only")) if "include_only" in e else None, "exclude": strs(e.get("exclude")),
+                "filters": [], "from": path}
                for e in d.get("entries") or [] if isinstance(e, dict) and isinstance(e.get("path"), str)]
-    return entries, strs(d.get("exclude")), None, bool(d.get("inherits"))
+    exclude, unresolved = strs(d.get("exclude")), []
+    for e in d.get("inherits") or []:
+        ip = e.get("path") if isinstance(e, dict) else e
+        if not isinstance(ip, str):
+            continue
+        ip = ip if os.path.isabs(ip) else os.path.join(base, ip)
+        if depth >= 5 or os.path.realpath(ip) in seen or not os.path.isfile(ip):
+            unresolved.append(ip)
+            continue
+        sub, sub_ex, sub_err, sub_un = agy_manifest(ip, depth + 1, seen)
+        if sub_err:
+            unresolved.append(ip)
+            continue
+        flt = ((strs(e.get("include_only")) if "include_only" in e else None), strs(e.get("exclude"))) if isinstance(e, dict) else (None, [])
+        for x in sub:
+            x["filters"] = x["filters"] + [flt]
+        entries += sub
+        exclude += [x for x in sub_ex if x not in exclude]
+        unresolved += sub_un
+    return entries, exclude, None, unresolved
 
 
-def agy_entry_skills(entry, base_dir, scope):
-    """清单里一项 entries 实际点到的 skill：path 可以是一个放着很多 skill 的目录（只扫一层），也可以就是一个 skill 的目录；
-    exclude 去掉点名的，include_only 只留点名的（可以点到嵌套一层以下的，比如 database/migrate-schema）。"""
-    root = entry["path"] if os.path.isabs(entry["path"]) else os.path.join(base_dir, entry["path"])
+def agy_entry_skills(entry, scope):
+    """清单里一项 entries 实际点到的 skill：path 可以是一个放着很多 skill 的目录（只扫一层），也可以就是一个 skill 的目录。
+    include_only 只留点名的（可以点到嵌套一层以下的，比如 database/migrate-schema），exclude 再去掉点名的；两样可以同时写，
+    同时写时被 exclude 点名的不加载（1.5.18 实验）。名字按目录名或相对路径匹配。inherits 那一层的筛选接着再过一遍。"""
+    root = entry["path"]
     if os.path.isfile(os.path.join(root, "SKILL.md")):
-        return list_skills(os.path.dirname(root.rstrip(os.sep)), scope, only=[os.path.basename(root.rstrip(os.sep))])
-    if entry["include_only"] is not None:
-        out = []
+        items = list_skills(os.path.dirname(root.rstrip(os.sep)), scope, only=[os.path.basename(root.rstrip(os.sep))])
+        for it in items:
+            it["rel"] = it["dir"]
+    elif entry["include_only"] is not None:
+        items = []
         for name in entry["include_only"]:
             sub = os.path.join(root, *name.split("/"))
-            out += list_skills(os.path.dirname(sub), scope, only=[os.path.basename(sub)])
-        return out
-    return [it for it in list_skills(root, scope) if it["dir"] not in entry["exclude"]]
+            for it in list_skills(os.path.dirname(sub), scope, only=[os.path.basename(sub)]):
+                it["rel"] = name
+                items.append(it)
+    else:
+        items = list_skills(root, scope)
+        for it in items:
+            it["rel"] = it["dir"]
+    hit = lambda it, names: it["rel"] in names or it["dir"] in names
+    items = [it for it in items if not hit(it, entry["exclude"])]
+    for inc, exc in entry.get("filters") or []:
+        items = [it for it in items if (inc is None or hit(it, inc)) and not hit(it, exc)]
+    return items
 
 
 def agy_rule_size(path, home, depth=0, seen=None):
@@ -2387,10 +2556,16 @@ def do_scan(args, home):
                 ap.append("%s 有 %d 字节（它用 @[标签](路径) 展开进来的正文也算在内），超过 Antigravity 每个规则文件 %d 字节的上限。"
                           "超出的部分被截掉，模型读不到（官方文档写明；实机的会话记录里也看到被截的文件末尾只剩一句 <truncated N bytes>）。" % (show(f, home), size, AGY_RULE_CAP))
         agy["problems"] = ap
-        # 自查：按上面的规则算出来的加载清单，和最近一次新开会话里 Antigravity 实际发给模型的规则清单对一遍
-        agy["chain_check"] = None
+        # 自查：按上面的规则算出来的加载清单，和 Antigravity 实际发给模型的规则清单对一遍。每个入口各对它最近的一个新会话
+        # （chain_check 是其中最新的那个）。能对的条件：这个会话的请求明细读得出来而且是完整的、它的工作目录还在；
+        # 明细完整但清单是空的也照对（空的就是「实际一份都没加载」，不是没有证据）
+        agy["chain_check"], agy["chain_checks"] = None, []
+
+        def checkable(s_):
+            return bool(s_.get("has_shape")) and not s_.get("partial") and bool(s_["cwd"]) and os.path.isdir(s_["cwd"])
+
         for s_ in sorted(ag.get("starts") or [], key=lambda x: x["ts"], reverse=True):
-            if not s_.get("files") or not s_["cwd"] or not os.path.isdir(s_["cwd"]):
+            if not checkable(s_) or any(c_["entry"] == s_["entrypoint"] for c_ in agy["chain_checks"]):
                 continue
             inl = set(os.path.realpath(x) for f in global_agy for x in agy_inlines(f, home))
             cf, in_repo = [], True
@@ -2404,14 +2579,15 @@ def do_scan(args, home):
             got = set(os.path.realpath(f["path"]) for f in s_["files"] if f["path"] != "user_global")
             n_glob = sum(1 for f in s_["files"] if f["path"] == "user_global")
             want_glob = sum(1 for x in standalone if os.path.isfile(x))
-            agy["chain_check"] = {"ts": s_["ts"], "cwd": s_["cwd"], "in_repo": in_repo,
-                                  "only_computed": sorted(want - got), "only_logged": sorted(got - want),
-                                  "global_logged": n_glob, "global_computed": want_glob,
-                                  "ok": want == got and n_glob == want_glob}
-            break
+            agy["chain_checks"].append({"ts": s_["ts"], "cwd": s_["cwd"], "entry": s_["entrypoint"], "in_repo": in_repo,
+                                        "only_computed": sorted(want - got), "only_logged": sorted(got - want),
+                                        "global_logged": n_glob, "global_computed": want_glob,
+                                        "ok": want == got and n_glob == want_glob})
+        if agy["chain_checks"]:
+            agy["chain_check"] = agy["chain_checks"][0]
 
         # skill：全局的、只有命令行读的两个目录、~/.agents/skills、skills.json 点名的、项目里的
-        entries, exclude, m_err, m_inherits = agy_manifest(os.path.join(cfg_dir, "skills.json"))
+        entries, exclude, m_err, m_unresolved = agy_manifest(os.path.join(cfg_dir, "skills.json"))
         track(os.path.join(cfg_dir, "skills.json"))
         agy["manifest_error"] = m_err
         agy["exclude"] = exclude
@@ -2419,18 +2595,16 @@ def do_scan(args, home):
         a_sk += list_skills(os.path.join(g_dir, "skills"), "cli-only")
         a_sk += list_skills(os.path.join(cfg_dir, "skills"), "global")
         for e_ in entries:
-            a_sk += agy_entry_skills(e_, cfg_dir, "manifest")
+            a_sk += agy_entry_skills(e_, "manifest")
         # ~/.agents/skills：命令行 1.5.16 起当作全局 skill 目录读（更新日志写明），同名时 ~/.gemini 下的优先
         a_sk += list_skills(os.path.join(home, ".agents", "skills"), "agents-home")
         seen_pk = set()
         for pr in projects:
-            for d in agy_dirs(pr["cwd"], home)[0]:
-                for x in AGY_DOT:
-                    base = os.path.join(d, x, "skills")
-                    if os.path.realpath(base) in seen_pk or not os.path.isdir(base) or (d == home and x == ".agents"):
-                        continue
-                    seen_pk.add(os.path.realpath(base))
-                    a_sk += list_skills(base, "project:" + d)
+            for base, scope in agy_skill_dirs(pr["cwd"], home):     # 项目里的；仓库设了个人目录的，个人目录里的也算
+                if os.path.realpath(base) in seen_pk or not os.path.isdir(base):
+                    continue
+                seen_pk.add(os.path.realpath(base))
+                a_sk += list_skills(base, scope)
         builtin, builtin_n = set(), 0
         for app in ag.get("dirs") or agy_app_dirs(home):
             bd = os.path.join(g_dir, app, "builtin", "skills")
@@ -2447,14 +2621,17 @@ def do_scan(args, home):
             if s_.get("skill_paths"):
                 latest_listed = s_
         arp = ag.get("skill_read_paths") or {}
+        ar_gone = ag.get("skill_reads_gone") or {}
         dir_count = Counter(it["dir"] for it in a_sk)
         user_level = {}        # 名字 → 用户级里优先级最高的那一份（a_sk 的顺序就是优先级：命令行专用 > ~/.gemini/config > ~/.agents）
         for it in a_sk:
             track(it["md"])
-            # 读过几次：按文件的真实路径归到具体那一份；目录名只此一家的，再用按名字数的那份兜底（会话里走软链等别的路径读的也算）
+            # 读过几次：按文件的真实路径归到具体那一份（走软链读的，真实路径也是它）。读的那个路径现在已经不在了的，没法按路径归，
+            # 目录名只此一家时算到它头上（宁可多算，多算只会让它留下）；路径还在、但读的是别处另一份同名文件的，不算它
             u = arp.get(os.path.realpath(it["path"]), new_use())
-            if dir_count[it["dir"]] == 1 and ar.get(it["dir"], new_use())["n"] > u["n"]:
-                u = ar[it["dir"]]
+            if dir_count[it["dir"]] == 1 and it["dir"] in ar_gone:
+                g_ = ar_gone[it["dir"]]
+                u = {"n": u["n"] + g_["n"], "last": max(u["last"], g_["last"])} if u["n"] else g_
             it["reads"], it["last"] = u["n"], u["last"]
             it["shared_with_claude"] = bool(c_real and inside(os.path.realpath(it["path"]), c_real))
             flags = []
@@ -2469,7 +2646,7 @@ def do_scan(args, home):
                 it["state"] = "on"
                 if it["name"] in exclude and it["name"] != it["dir"]:
                     flags.append("排除名单里写的是它的 name（%s），Antigravity 按目录名（%s）匹配，实际没排除掉" % (it["name"], it["dir"]))
-            if it["state"] == "on" and not it["scope"].startswith("project:"):
+            if it["state"] == "on" and not agy_ws(it["scope"]):
                 win = user_level.get(it["name"])
                 if win is None:
                     user_level[it["name"]] = it
@@ -2479,7 +2656,7 @@ def do_scan(args, home):
                 else:
                     it["state"] = "shadowed"    # 同名、优先级低：不进发给模型的清单（官方文档的优先级 + 实测）
                     it["shadowed_by"] = win["path"]
-            if it["state"] == "on" and it["scope"].startswith("project:") and it["name"] in user_level:
+            if it["state"] == "on" and agy_ws(it["scope"]) and it["name"] in user_level:
                 flags.append("和全局的一个 skill 同名：在这个项目里用的是项目这份")
             if it["reads"] == 0 and it["state"] == "on":
                 pat = ref_patterns(it["dir"])
@@ -2492,6 +2669,8 @@ def do_scan(args, home):
                 age = (now - it["installed_ts"]) / 86400
                 if age < args.days:
                     flags.append("装了才 %d 天" % max(age, 0))
+            if m_unresolved and it["reads"] == 0 and it["state"] == "on":
+                flags.append("清单文件 inherits 的一份清单读不了，说不准它现在是不是真的在加载")
             it["flags"] = flags
             if it["state"] == "on" and it["scope"] in ("global", "manifest", "agents-home"):
                 it["group"] = ("B" if flags else "A") if it["reads"] == 0 else "E"
@@ -2503,17 +2682,15 @@ def do_scan(args, home):
         # 自查：按上面的规则算「这个会话该看到哪些 skill」，和它实际发给模型的清单（去掉内置的）对一遍
         agy["skills_check"], agy["skills_checks"] = None, []        # 每个入口各查最近的一个会话；skills_check 是其中最新的那个
         for s_ in sorted(ag.get("starts") or [], key=lambda x: x["ts"], reverse=True):
-            if not s_.get("skill_paths") or not s_["cwd"] or not os.path.isdir(s_["cwd"]):
-                continue
-            if any(c_["entry"] == s_["entrypoint"] for c_ in agy["skills_checks"]):
+            if not checkable(s_) or any(c_["entry"] == s_["entrypoint"] for c_ in agy["skills_checks"]):
                 continue
             cli = s_["entrypoint"] == "antigravity-cli"
             cand = [it for it in a_sk if it["scope"] == "cli-only"] if cli else []
-            for w_ in s_.get("cwds") or [s_["cwd"]]:
-                for d in agy_dirs(w_, home)[0]:
-                    for x in AGY_DOT:
-                        if not (d == home and x == ".agents"):
-                            cand += list_skills(os.path.join(d, x, "skills"), "project:" + d)
+            ws_pers, ws_proj = [], []
+            for w_ in s_.get("cwds") or [s_["cwd"]]:        # 一个会话登记了几个工作目录的，每个目录的都算
+                for base, scope in agy_skill_dirs(w_, home):
+                    (ws_pers if scope.startswith("personal:") else ws_proj).extend(list_skills(base, scope))
+            cand += ws_pers + ws_proj
             cand += [it for it in a_sk if it["scope"] in ("global", "manifest")]
             if cli:
                 cand += [it for it in a_sk if it["scope"] == "agents-home"]
@@ -2530,7 +2707,7 @@ def do_scan(args, home):
             agy["skills_check"] = agy["skills_checks"][0]
         known_a = set(n for it in a_sk for n in (it["name"], it["dir"])) | builtin
         agy["other_skill_reads"] = {k: v["n"] for k, v in sorted(ar.items(), key=lambda kv: -kv[1]["n"]) if k not in known_a}
-        agy["manifest_inherits"] = m_inherits
+        agy["manifest_unresolved"] = m_unresolved
 
         # MCP：全局 mcp_config.json，加上各项目的 .agents/mcp_config.json
         a_mcp, mcp_errors = [], []
@@ -2609,9 +2786,10 @@ def do_scan(args, home):
         agy["cli_context_window"] = cli_s.get("contextWindow") if isinstance(cli_s.get("contextWindow"), (str, int)) else None
         agy["manifests"] = sorted(set(
             [f for f in (os.path.join(cfg_dir, "rules.json"),) if os.path.isfile(f)]
-            + ([os.path.join(cfg_dir, "skills.json")] if agy.get("manifest_inherits") else [])
-            + [os.path.join(d, x, n) for pr in projects for d in agy_dirs(pr["cwd"], home)[0] for x in AGY_DOT
-               for n in ("rules.json", "skills.json") if os.path.isfile(os.path.join(d, x, n))]))
+            + list(agy.get("manifest_unresolved") or [])
+            + [os.path.join(os.path.dirname(base), n) for pr in projects for base, _sc in agy_skill_dirs(pr["cwd"], home)
+               for n in ("rules.json", "skills.json") if os.path.isfile(os.path.join(os.path.dirname(base), n))]))
+        agy["summaries_stale"] = ag.get("summaries_stale", 0)
         legacy, _e = load_json_file(os.path.join(g_dir, "settings.json"))
         agy["legacy_settings"] = sorted(k for k in ("mcpServers", "hooks") if isinstance(legacy, dict) and legacy.get(k))
     ev["antigravity"] = agy
@@ -3191,7 +3369,12 @@ def render_agy_startup(L, a, home, days):
     L.append("")
     L.append("######## 开局（Antigravity）：新会话的第一次请求带了多少 token ########")
     if not st:
-        L.append("会话日志里没找到新开会话的记录（窗口内没有新会话，或这个版本的日志位置变了），这一块量不出来。")
+        if a.get("start_no_usage") or a.get("kind_unknown"):
+            L.append("窗口内有新会话，但开局都量不出来：%s这一块没有数字，也没有拿后面的请求顶替。" % "".join(
+                ["%d 个会话的第一条模型回复没有记用量；" % a["start_no_usage"] if a.get("start_no_usage") else "",
+                 "%d 个会话分不清是用户开的还是子代理；" % a["kind_unknown"] if a.get("kind_unknown") else ""]))
+        else:
+            L.append("会话日志里没找到新开会话的记录（窗口内没有新会话，或这个版本的日志位置变了），这一块量不出来。")
         L.append("替代办法：让用户在 Antigravity 命令行里新开一个会话，输入 /context，把结果贴过来。")
         return
     src = "实测（Antigravity 自己记在会话日志里的用量，不是估的）"
@@ -3255,15 +3438,20 @@ def render_agy_startup(L, a, home, days):
                     L.append("             · %s 字符  %s（%d 个工具）%s" % (num(v_["chars"]), srv, v_["n"],
                              "" if srv in known_srv else "  ← 脚本查过的 mcp_config.json 里没有它，来源未知：可能是开这个会话的程序自己带进来的（别的工具通过 agy acp 开的会话会这样），也可能是插件带的"))
     if la.get("partial"):
-        L.append("  注意：这个会话的会话库里有几段记录脚本认不出来，上面的明细不完整，缺的部分没有列出来（不是 0）。")
+        pp_ = la.get("partial_parts") or []
+        which = "、".join(dict(AGY_PART_NAMES).get(k, k) for k in pp_) if pp_ and len(pp_) < 5 else "系统提示的各段"
+        L.append("  注意：这个会话的会话库里有几条记录脚本认不出来，上面的明细不完整：「%s」的数偏小（缺的没有列出来，不是 0）；其余几项不受影响。" % which)
     if a.get("no_shape"):
         L.append("（窗口内有 %d 个新会话的会话库读不出明细，它们只算进了上面的 token 统计。）" % a["no_shape"])
     if a.get("start_no_usage"):
         L.append("（有 %d 个会话的第一条模型回复没有记用量，开局量不出来，没算进上面的统计，也没有拿后面的请求顶替。）" % a["start_no_usage"])
     if a.get("kind_unknown"):
-        L.append("（有 %d 个会话在会话摘要库里查不到、日志开头也没有用户输入，分不清是用户开的还是子代理，没算进任何统计。）" % a["kind_unknown"])
+        L.append("（有 %d 个会话在会话摘要库里查不到、日志开头也没有用户输入，分不清是用户开的还是子代理，没算进开局和请求数的统计；"
+                 "它们读过的 skill、调过的 MCP 照样算了。）" % a["kind_unknown"])
     if a.get("wal_pending"):
-        L.append("（有 %d 个会话库旁边还有没并入的改动（-wal 文件非空）。脚本只读主库、不碰这些文件，这几个会话的各部分明细可能不是最新一次请求的；token 数取自日志，不受影响。）" % a["wal_pending"])
+        L.append("（有 %d 个会话库旁边有还没并入的改动（-wal 文件非空），脚本想拷一份出来读没拷成，只读了主库：这几个会话的各部分明细可能不是最新一次请求的；token 数取自日志，不受影响。）" % a["wal_pending"])
+    if a.get("summaries_stale"):
+        L.append("（会话摘要库旁边有还没并入的改动，脚本没能读到最新的：谁是子代理改按日志开头有没有用户输入来判断。）")
     L.append("怎么用这一块：先砍排在前面、而且「能瘦」「能减」的。Antigravity 每次请求前都会重新读规则和 skill，改完下一句话就生效；"
              "要对比开局，新开一个会话说一句话，再扫一次。")
 
@@ -3376,7 +3564,8 @@ def render_agy(L, a, home, days, cap, show_all):
     if a.get("pointers"):
         L.append("只给路径和描述、用到才读的规则（trigger: model_decision）：%d 份。" % len(a["pointers"]))
     if a.get("manifests"):
-        L.append("注意：有清单文件 %s。清单文件能另外点名要加载或要跳过的规则和 skill，脚本没有展开它们，上面的名单可能不全；以开局部分列的实际加载为准。" % "、".join(show(f, home) for f in a["manifests"][:4]))
+        L.append("注意：有脚本没有展开的清单文件 %s（规则的清单 rules.json、项目里的 skills.json，或者 inherits 指过去却读不了的清单）。"
+                 "清单文件能另外点名要加载或要跳过的规则和 skill，上面的名单可能不全；以开局部分列的实际加载为准。" % "、".join(show(f, home) for f in a["manifests"][:4]))
     for sc in a.get("skills_checks") or []:
         if sc["ok"]:
             continue
@@ -3386,10 +3575,11 @@ def render_agy(L, a, home, days, cap, show_all):
             L.append("  实际发给了模型、脚本没算到的 %d 个：%s" % (len(sc["only_logged"]), "、".join(show(f, home) for f in sc["only_logged"][:6])))
         if sc["only_computed"]:
             L.append("  脚本算到了、实际没发给模型的 %d 个：%s" % (len(sc["only_computed"]), "、".join(show(f, home) for f in sc["only_computed"][:6])))
-    ck = a.get("chain_check")
-    if ck and not ck["ok"]:
-        L.append("注意：脚本按规则算出来的规则文件清单，和 %s 在 %s 新开的那个会话里 Antigravity 实际加载的不一样（以实际加载的为准，开局部分列的就是实际加载的）。"
-                 "可能是那之后改过规则文件，也可能是这个版本的加载规则和脚本知道的不同。" % (md(ck["ts"]), show(ck["cwd"], home)))
+    for ck in a.get("chain_checks") or ([a["chain_check"]] if a.get("chain_check") else []):
+        if ck["ok"]:
+            continue
+        L.append("注意：脚本按规则算出来的规则文件清单，和 %s 在 %s 新开的那个会话（%s）里 Antigravity 实际加载的不一样（以实际加载的为准，开局部分列的就是实际加载的）。"
+                 "可能是那之后改过规则文件，也可能是这个版本的加载规则和脚本知道的不同。" % (md(ck["ts"]), show(ck["cwd"], home), agy_entry(ck.get("entry"))))
         if ck["only_logged"]:
             L.append("  实际加载了、脚本没算到的：" + "、".join(show(f, home) for f in ck["only_logged"][:6]))
         if ck["only_computed"]:
@@ -4091,13 +4281,17 @@ def cmd_skills_agy(args, home):
     g = gemini_dir(home)
     cfg = os.path.join(g, "config")
     mf = os.path.join(cfg, "skills.json")
-    known, alias = {}, {}
+    known, alias, now_at = {}, {}, {}        # now_at：目录名 → 此刻磁盘上叫这个目录名的每一份 {SKILL.md 的真实路径: 内容指纹}
+
+    def note(it, scope):
+        known.setdefault(it["dir"], set()).add(scope)
+        now_at.setdefault(it["dir"], {})[os.path.realpath(it["md"])] = it["md_sha"]
+        if it["name"] != it["dir"]:
+            alias.setdefault(it["name"], it["dir"])
 
     def add(base, scope):
         for it in list_skills(base, scope):
-            known.setdefault(it["dir"], set()).add(scope)
-            if it["name"] != it["dir"]:
-                alias.setdefault(it["name"], it["dir"])
+            note(it, scope)
 
     add(os.path.join(cfg, "skills"), "global")
     add(os.path.join(g, "antigravity-cli", "skills"), "cli-only")
@@ -4105,13 +4299,11 @@ def cmd_skills_agy(args, home):
     add(os.path.join(home, ".agents", "skills"), "agents-home")
     entries, _ex, _err, _inh = agy_manifest(mf)
     for e_ in entries:
-        for it in agy_entry_skills(e_, cfg, "manifest"):
-            known.setdefault(it["dir"], set()).add("manifest")
-            if it["name"] != it["dir"]:
-                alias.setdefault(it["name"], it["dir"])
+        for it in agy_entry_skills(e_, "manifest"):
+            note(it, "manifest")
+    user_now = dict((k, dict(v)) for k, v in now_at.items())      # 用户级的（不含内置的、项目里的）
     for app in agy_app_dirs(home):
         add(os.path.join(g, app, "builtin", "skills"), "builtin")
-    live = set(known)        # 此刻磁盘上真有的（下面再把扫描里记的项目 skill 并进 known）
     a = None
     if args.scan:
         a, _ev = agy_scan(args.scan)
@@ -4142,9 +4334,16 @@ def cmd_skills_agy(args, home):
         if args.group.upper() not in ("A", "B"):
             die("Antigravity 这边 --group 取 A 或 B。E 组是在用的，不整组改；要改其中某个就点名。")
         members = [it["dir"] for it in a.get("skills") or [] if it.get("group") == args.group.upper()]
-        gone = [n for n in members if n not in live]
-        if gone:
-            die("这份扫描之后配置变过：%s 组里的 %s 现在已经不在原来的位置。没有改。重新 scan --json 一次，再用新的那份。" % (args.group.upper(), "、".join(gone)))
+        # 整组改是照着那份扫描改，用户确认的也是那份扫描里的名单。排除名单按目录名生效，所以要确认：此刻用户级目录里叫这个目录名的
+        # 每一份，都是扫描时就在的那一份（位置和 SKILL.md 的内容都没变）。多了、少了、换了内容，都要求重新扫描
+        then_at = {}
+        for it in a.get("skills") or []:
+            if not agy_ws(it["scope"]) and it["scope"] != "builtin":
+                then_at.setdefault(it["dir"], {})[os.path.realpath(it["md"])] = it.get("md_sha")
+        changed = [n for n in members if user_now.get(n, {}) != then_at.get(n, {})]
+        if changed:
+            die("这份扫描之后配置变过：%s 组里的 %s 现在和扫描时不是同一份了（搬走了、换了位置、改了内容，或者别处多了一个同目录名的 skill）。"
+                "没有改。重新 scan --json 一次，把新的名单给用户确认之后再用新的那份。" % (args.group.upper(), "、".join(changed)))
         names += members
     skip = set(args.exclude or [])
     stray = [n for n in skip if n not in names]
@@ -4837,7 +5036,10 @@ def cmd_compare(args, home):
     if a.get("model") and b.get("model") and a["model"] != b["model"]:
         L.append("  注意：两次用的模型不一样，同样的内容折出来的 token 数会有出入。")
     pb, pa = b.get("parts") or {}, a.get("parts") or {}
-    lack = [n for n, x, pp in (("改之前", b, pb), ("改之后", a, pa)) if not sum(pp.values()) or x.get("partial")]
+    # 一侧完全没有明细：分项整体没法比。只是其中几项不可靠（比如一条工具声明认不出来）：那几项不比，其余照比
+    lack = [n for n, x, pp in (("改之前", b, pb), ("改之后", a, pa))
+            if not sum(pp.values()) or (x.get("partial") and not x.get("partial_parts"))]
+    shaky = set(b.get("partial_parts") or []) | set(a.get("partial_parts") or [])
     if lack:
         L.append("")
         L.append("各部分的大小：%s那次会话读不出完整的明细，分项没法比（不是变成了 0）。上面的 token 数取自日志，不受影响。" % "和".join(lack))
@@ -4850,6 +5052,9 @@ def cmd_compare(args, home):
     L.append("  %s  %s  %s" % ("改之前".rjust(8), "改之后".rjust(8), ""))
     for key, name in (AGY_PART_NAMES if agy else PART_NAMES):
         x, y = pb.get(key, 0), pa.get(key, 0)
+        if key in shaky:
+            L.append("  %s  %s  %s  这一项有一侧的记录读不全，没法比（不是变成了 0）" % ("—".rjust(10), "—".rjust(10), name))
+            continue
         if not x and not y:
             continue
         extra = ""
